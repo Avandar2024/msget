@@ -86,6 +86,8 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		return err
 	}
 	fmt.Fprintf(d.writer(), "模型 %s@%s：%d 个文件，%s -> %s\n", repo, revision, len(selected), humanBytes(total), root)
+	progress := newDownloadProgress(d.writer(), total, len(selected))
+	defer progress.finish()
 
 	jobs := make(chan repoFile)
 	slots := make(chan struct{}, d.Workers)
@@ -97,14 +99,14 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		go func() {
 			defer wg.Done()
 			for f := range jobs {
-				if err := d.downloadFile(ctx, repo, revision, root, f, slots); err != nil {
+				if err := d.downloadFile(ctx, repo, revision, root, f, slots, progress); err != nil {
 					mu.Lock()
 					failures = append(failures, fmt.Errorf("%s: %w", f.Path, err))
-					fmt.Fprintf(d.writer(), "失败  %s: %v\n", f.Path, err)
+					progress.log("失败  %s: %v\n", f.Path, err)
 					mu.Unlock()
 				} else {
 					mu.Lock()
-					fmt.Fprintf(d.writer(), "完成  %s (%s)\n", f.Path, humanBytes(f.Size))
+					progress.log("完成  %s (%s)\n", f.Path, humanBytes(f.Size))
 					mu.Unlock()
 				}
 			}
@@ -124,6 +126,7 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 	if len(failures) > 0 {
 		return fmt.Errorf("%d 个文件下载失败（可重新运行以断点续传）: %w", len(failures), errors.Join(failures...))
 	}
+	progress.finish()
 	fmt.Fprintf(d.writer(), "下载完成：%s\n", root)
 	return nil
 }
@@ -154,12 +157,15 @@ func (d *Downloader) list(ctx context.Context, repo, revision string) ([]repoFil
 	return result.Data.Files, nil
 }
 
-func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root string, f repoFile, slots chan struct{}) error {
+func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root string, f repoFile, slots chan struct{}, progress *downloadProgress) error {
+	fileProgress := progress.file(f.Size)
 	target, err := safeTarget(root, f.Path)
 	if err != nil {
 		return err
 	}
 	if ok, err := d.validExisting(target, f); err == nil && ok {
+		fileProgress.set(f.Size)
+		progress.fileDone()
 		return nil
 	}
 	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
@@ -178,14 +184,15 @@ func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root stri
 		}
 		var downloadErr error
 		if d.Parts > 1 && f.Size >= 8<<20 {
-			downloadErr = d.downloadParallel(ctx, repo, revision, part, f, slots)
+			downloadErr = d.downloadParallel(ctx, repo, revision, part, f, slots, fileProgress, progress)
 			if errors.Is(downloadErr, errRangeUnsupported) {
 				_ = os.Remove(part)
 				_ = os.Remove(part + ".meta")
-				downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+				fileProgress.set(0)
+				downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots, fileProgress, progress)
 			}
 		} else {
-			downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+			downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots, fileProgress, progress)
 		}
 		if downloadErr != nil {
 			last = downloadErr
@@ -195,26 +202,32 @@ func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root stri
 			last = err
 			_ = os.Remove(part)
 			_ = os.Remove(part + ".meta")
+			fileProgress.set(0)
 			continue
 		}
 		if err := os.Rename(part, target); err != nil {
 			return err
 		}
 		_ = os.Remove(part + ".meta")
+		fileProgress.set(f.Size)
+		progress.fileDone()
 		return nil
 	}
 	return last
 }
 
 func (d *Downloader) downloadAttempt(ctx context.Context, repo, revision, part string, f repoFile) error {
-	return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, nil)
+	p := newDownloadProgress(io.Discard, f.Size, 1)
+	return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, nil, p.file(f.Size), p)
 }
 
-func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}) error {
+func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}, fileProgress *fileProgress, progress *downloadProgress) error {
 	if err := acquire(ctx, slots); err != nil {
 		return err
 	}
 	defer release(slots)
+	progress.connection(1)
+	defer progress.connection(-1)
 	var offset int64
 	if st, err := os.Stat(part); err == nil {
 		offset = st.Size()
@@ -231,6 +244,7 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 		_ = os.Remove(part)
 		offset = 0
 	}
+	fileProgress.set(offset)
 	if err := writePartState(meta, state); err != nil {
 		return fmt.Errorf("保存续传状态: %w", err)
 	}
@@ -272,6 +286,9 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 			return fmt.Errorf("保存续传状态: %w", err)
 		}
 	}
+	if !appendMode {
+		fileProgress.set(0)
+	}
 	flags := os.O_CREATE | os.O_WRONLY
 	if appendMode {
 		flags |= os.O_APPEND
@@ -283,7 +300,7 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	if err != nil {
 		return err
 	}
-	reader := &activityReader{r: resp.Body, timer: timer, timeout: d.Timeout}
+	reader := &activityReader{r: resp.Body, timer: timer, timeout: d.Timeout, onRead: fileProgress.read}
 	_, copyErr := io.CopyBuffer(out, reader, make([]byte, 1<<20))
 	syncErr := out.Sync()
 	closeErr := out.Close()
@@ -360,10 +377,10 @@ func writePartState(path string, state partState) error {
 	return err
 }
 
-func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}) error {
+func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}, fileProgress *fileProgress, progress *downloadProgress) error {
 	parts := min(d.Parts, int((f.Size+(8<<20)-1)/(8<<20)))
 	if parts < 2 {
-		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots, fileProgress, progress)
 	}
 	state := newPartState(repo, revision, f, parts)
 	meta := part + ".meta"
@@ -388,6 +405,13 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	var mu sync.Mutex
 	var errs []error
 	chunk := (f.Size + int64(parts) - 1) / int64(parts)
+	var completed int64
+	for i, done := range state.Done {
+		if done {
+			completed += min(chunk, f.Size-int64(i)*chunk)
+		}
+	}
+	fileProgress.set(completed)
 	for i := 0; i < parts; i++ {
 		if state.Done[i] {
 			continue
@@ -404,7 +428,9 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 				return
 			}
 			defer release(slots)
-			if err := d.downloadRange(ctx, repo, revision, out, f.Path, start, end); err != nil {
+			progress.connection(1)
+			defer progress.connection(-1)
+			if err := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress); err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
@@ -449,7 +475,7 @@ func validContentRange(value string, offset, size int64) bool {
 	return start == offset && end >= start && (size <= 0 || total == size)
 }
 
-func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64) error {
+func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64, fileProgress *fileProgress) error {
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := time.AfterFunc(d.Timeout, cancel)
@@ -471,7 +497,7 @@ func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, o
 	if resp.StatusCode != http.StatusPartialContent || !strings.HasPrefix(resp.Header.Get("Content-Range"), wantPrefix) {
 		return errRangeUnsupported
 	}
-	written, err := io.CopyBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout}, make([]byte, 1<<20))
+	written, err := io.CopyBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout, onRead: fileProgress.read}, make([]byte, 1<<20))
 	if err != nil {
 		return err
 	}
@@ -560,12 +586,16 @@ type activityReader struct {
 	r       io.Reader
 	timer   *time.Timer
 	timeout time.Duration
+	onRead  func(int)
 }
 
 func (r *activityReader) Read(p []byte) (int, error) {
 	n, err := r.r.Read(p)
 	if n > 0 {
 		r.timer.Reset(r.timeout)
+		if r.onRead != nil {
+			r.onRead(n)
+		}
 	}
 	return n, err
 }

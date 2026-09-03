@@ -144,7 +144,8 @@ func TestParallelRanges(t *testing.T) {
 
 	part := filepath.Join(t.TempDir(), "model.part")
 	d := Downloader{Endpoint: server.URL, Workers: 3, Parts: 3, Timeout: 5 * time.Second, Client: server.Client()}
-	if err := d.downloadParallel(context.Background(), "a/b", "master", part, repoFile{Path: "model", Size: int64(len(body))}, make(chan struct{}, 3)); err != nil {
+	progress := newDownloadProgress(io.Discard, int64(len(body)), 1)
+	if err := d.downloadParallel(context.Background(), "a/b", "master", part, repoFile{Path: "model", Size: int64(len(body))}, make(chan struct{}, 3), progress.file(int64(len(body))), progress); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(part)
@@ -201,7 +202,8 @@ func TestParallelResumeSkipsCompletedParts(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := Downloader{Endpoint: server.URL, Workers: parts, Parts: parts, Timeout: 5 * time.Second, Client: server.Client()}
-	if err := d.downloadParallel(context.Background(), "a/b", "master", part, file, make(chan struct{}, parts)); err != nil {
+	progress := newDownloadProgress(io.Discard, int64(len(body)), 1)
+	if err := d.downloadParallel(context.Background(), "a/b", "master", part, file, make(chan struct{}, parts), progress.file(int64(len(body))), progress); err != nil {
 		t.Fatal(err)
 	}
 	if len(ranges) != parts-1 {
