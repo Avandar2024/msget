@@ -66,6 +66,21 @@ Interactive terminals show an ASCII progress bar, percentage, transferred/total 
 
 The HTTP pool reuses connections while limiting total and per-host concurrency. Idle connections are retained for 90 seconds and closed when a download finishes.
 
+On hosts with genuinely different IPv4 and IPv6 routes, the
+`-network dual` mode maintains a separate connection pool for each family and
+alternates concurrent requests between them:
+
+```bash
+./msget -network dual Qwen/Qwen3-0.6B
+```
+
+If one address family cannot connect, that request falls back to the other.
+Use `-network ipv4` or `-network ipv6` to force one family. The default is
+`-network dual`; pass `-network auto` to use Go's normal Happy Eyeballs
+selection. Dual mode improves throughput only when the two routes have
+independent usable capacity;
+the origin/CDN, local uplink, or disk may still be the bottleneck.
+
 To use the international endpoint or a mirror:
 
 ```bash

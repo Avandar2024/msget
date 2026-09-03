@@ -25,6 +25,7 @@ type Downloader struct {
 	Retries         int
 	Timeout         time.Duration
 	IdleConnTimeout time.Duration
+	Network         string
 	Verify          bool
 	Out             io.Writer
 	Client          *http.Client

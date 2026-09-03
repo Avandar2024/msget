@@ -348,7 +348,7 @@ func TestPatterns(t *testing.T) {
 }
 
 func TestHTTPTransportPool(t *testing.T) {
-	d := Downloader{Workers: 7, Timeout: 45 * time.Second, IdleConnTimeout: 2 * time.Minute}
+	d := Downloader{Workers: 7, Timeout: 45 * time.Second, IdleConnTimeout: 2 * time.Minute, Network: NetworkAuto}
 	client := d.client()
 	transport, ok := client.Transport.(*http.Transport)
 	if !ok {

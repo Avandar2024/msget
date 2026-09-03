@@ -2,11 +2,16 @@ package downloader
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
 )
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
 
 func TestWriter(t *testing.T) {
 	t.Parallel()
@@ -108,5 +113,56 @@ func TestValidContentRange(t *testing.T) {
 		if got := validContentRange(tt.value, tt.offset, tt.size); got != tt.want {
 			t.Errorf("validContentRange(%q, %d, %d) = %v, want %v", tt.value, tt.offset, tt.size, got, tt.want)
 		}
+	}
+}
+
+func TestDualTransportAlternatesFamilies(t *testing.T) {
+	t.Parallel()
+	var used []string
+	transport := &dualTransport{transports: [2]http.RoundTripper{
+		roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			used = append(used, NetworkIPv4)
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+		}),
+		roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			used = append(used, NetworkIPv6)
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+		}),
+	}}
+	req, _ := http.NewRequest(http.MethodGet, "https://example.test/file", nil)
+	for range 4 {
+		if _, err := transport.RoundTrip(req); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := strings.Join(used, ","); got != "ipv4,ipv6,ipv4,ipv6" {
+		t.Fatalf("family order = %s", got)
+	}
+}
+
+func TestDualTransportFallsBack(t *testing.T) {
+	t.Parallel()
+	transport := &dualTransport{transports: [2]http.RoundTripper{
+		roundTripperFunc(func(*http.Request) (*http.Response, error) {
+			return nil, errors.New("IPv4 unavailable")
+		}),
+		roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+		}),
+	}}
+	req, _ := http.NewRequest(http.MethodGet, "https://example.test/file", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestDefaultNetworkIsDual(t *testing.T) {
+	t.Parallel()
+	if _, ok := (&Downloader{}).client().Transport.(*dualTransport); !ok {
+		t.Fatal("empty Network should select dual transport")
 	}
 }

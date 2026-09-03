@@ -47,6 +47,7 @@ func main() {
 	var includes, excludes stringList
 	output := flag.String("o", "", "output directory (default: model name)")
 	revision := flag.String("revision", "master", "branch, tag, or commit")
+	network := flag.String("network", downloader.NetworkDual, "connection family: auto, ipv4, ipv6, or dual")
 	showVersion := flag.Bool("version", false, "show version")
 	flag.Var(&includes, "include", "download only files matching this glob (repeatable)")
 	flag.Var(&excludes, "exclude", "exclude files matching this glob (repeatable)")
@@ -62,6 +63,11 @@ func main() {
 		os.Exit(2)
 	}
 	repo := flag.Arg(0)
+	switch *network {
+	case downloader.NetworkAuto, downloader.NetworkIPv4, downloader.NetworkIPv6, downloader.NetworkDual:
+	default:
+		fatal(fmt.Errorf("invalid -network %q (want auto, ipv4, ipv6, or dual)", *network))
+	}
 	if *output == "" {
 		parts := strings.Split(strings.Trim(repo, "/"), "/")
 		*output = parts[len(parts)-1]
@@ -79,6 +85,7 @@ func main() {
 		Retries:         5,
 		Timeout:         60 * time.Second,
 		IdleConnTimeout: 90 * time.Second,
+		Network:         *network,
 		Verify:          true,
 		Out:             os.Stderr,
 	}
