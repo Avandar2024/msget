@@ -58,7 +58,7 @@ For private models, provide the token through an environment variable so it does
 MODELSCOPE_API_TOKEN=ms-xxx ./msget owner/private-model
 ```
 
-Run `./msget -h` for all options. The downloader automatically selects 2-8 connections based on available CPUs. Multiple files are downloaded concurrently, and files of at least 8 MiB may use up to four ranges. Failed transfers are retried five times and server-provided SHA-256 hashes are verified. Connections time out only when connecting or after 60 seconds without data; large files have no total time limit.
+Run `./msget -h` for all options. The downloader automatically selects 2-8 connections based on available CPUs. Multiple files are downloaded concurrently, and files of at least 8 MiB use a dynamic queue of roughly 64 MiB ranges served by up to four connections. Faster connections naturally claim more ranges instead of waiting for the slowest fixed partition. Failed transfers are retried five times and server-provided SHA-256 hashes are verified. Connections time out only when connecting or after 60 seconds without data; large files have no total time limit.
 
 Incomplete files and atomically updated range state are stored as `.part` and `.part.meta`. Run the same command again after an interruption to resume. Resume state is tied to the model, revision, path, size, and SHA-256 value, so stale data is discarded when the remote file changes. Sequential resume uses ETag or Last-Modified with `If-Range`. If a server does not support HTTP ranges, the downloader falls back to one connection.
 

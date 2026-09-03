@@ -198,7 +198,7 @@ func TestParallelRanges(t *testing.T) {
 	defer server.Close()
 
 	part := filepath.Join(t.TempDir(), "model.part")
-	d := Downloader{Endpoint: server.URL, Workers: 3, Parts: 3, Timeout: 5 * time.Second, Client: server.Client()}
+	d := Downloader{Endpoint: server.URL, Workers: 3, Parts: 3, RangeSize: 4 << 20, Timeout: 5 * time.Second, Client: server.Client()}
 	progress := newDownloadProgress(io.Discard, int64(len(body)), 1)
 	if err := d.downloadParallel(context.Background(), "a/b", "master", part, repoFile{Path: "model", Size: int64(len(body))}, make(chan struct{}, 3), progress.file(int64(len(body))), progress); err != nil {
 		t.Fatal(err)
@@ -210,8 +210,16 @@ func TestParallelRanges(t *testing.T) {
 	if !strings.EqualFold(fmt.Sprintf("%x", sha256.Sum256(got)), fmt.Sprintf("%x", sha256.Sum256(body))) {
 		t.Fatal("parallel download content mismatch")
 	}
-	if len(ranges) < 2 {
-		t.Fatalf("got %d range request(s), want at least 2", len(ranges))
+	if len(ranges) <= d.Parts {
+		t.Fatalf("got %d range request(s), want more than %d connections", len(ranges), d.Parts)
+	}
+}
+
+func TestParallelLayoutUsesDynamicRanges(t *testing.T) {
+	t.Parallel()
+	connections, ranges := parallelLayout(1<<30, 4, 64<<20)
+	if connections != 4 || ranges != 16 {
+		t.Fatalf("layout = %d connections, %d ranges; want 4, 16", connections, ranges)
 	}
 }
 

@@ -82,6 +82,7 @@ func main() {
 		UserAgent:       "msget/" + version,
 		Workers:         workers,
 		Parts:           min(4, workers),
+		RangeSize:       64 << 20,
 		Retries:         5,
 		Timeout:         60 * time.Second,
 		IdleConnTimeout: 90 * time.Second,

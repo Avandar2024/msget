@@ -22,6 +22,7 @@ type Downloader struct {
 	UserAgent       string
 	Workers         int
 	Parts           int
+	RangeSize       int64
 	Retries         int
 	Timeout         time.Duration
 	IdleConnTimeout time.Duration
@@ -323,12 +324,26 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 
 var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
+const dynamicRangeSize int64 = 64 << 20
+
+func parallelLayout(size int64, maxConnections int, rangeSize int64) (connections, ranges int) {
+	connections = min(maxConnections, int((size+(8<<20)-1)/(8<<20)))
+	if connections < 2 {
+		return max(1, connections), max(1, connections)
+	}
+	if rangeSize <= 0 {
+		rangeSize = dynamicRangeSize
+	}
+	ranges = max(connections, int((size+rangeSize-1)/rangeSize))
+	return connections, ranges
+}
+
 func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}, fileProgress *fileProgress, progress *downloadProgress) error {
-	parts := min(d.Parts, int((f.Size+(8<<20)-1)/(8<<20)))
-	if parts < 2 {
+	connections, ranges := parallelLayout(f.Size, d.Parts, d.RangeSize)
+	if connections < 2 {
 		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots, fileProgress, progress)
 	}
-	state := newPartState(repo, revision, f, parts)
+	state := newPartState(repo, revision, f, ranges)
 	meta := part + ".meta"
 	matched := loadMatchingPartState(meta, state, &state)
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o644)
@@ -337,8 +352,8 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	}
 	defer out.Close()
 	if st, err := out.Stat(); err != nil || st.Size() != f.Size || !matched {
-		state.Done = make([]bool, parts)
-		state.Received = make([]int64, parts)
+		state.Done = make([]bool, ranges)
+		state.Received = make([]int64, ranges)
 		if err := out.Truncate(f.Size); err != nil {
 			return err
 		}
@@ -351,7 +366,7 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
-	chunk := (f.Size + int64(parts) - 1) / int64(parts)
+	chunk := (f.Size + int64(ranges) - 1) / int64(ranges)
 	var completed int64
 	for i := range state.Done {
 		partSize := min(chunk, f.Size-int64(i)*chunk)
@@ -362,45 +377,67 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 		completed += state.Received[i]
 	}
 	fileProgress.set(completed)
-	for i := 0; i < parts; i++ {
-		if state.Done[i] {
-			continue
+	pending := make([]int, 0, ranges)
+	for i := range state.Done {
+		if !state.Done[i] {
+			pending = append(pending, i)
 		}
-		partStart := int64(i) * chunk
-		start := partStart + state.Received[i]
-		end := min(partStart+chunk, f.Size) - 1
-		wg.Add(1)
-		go func(index int, start, end int64) {
-			defer wg.Done()
-			if err := acquire(ctx, slots); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-				return
-			}
-			defer release(slots)
-			progress.connection(1)
-			defer progress.connection(-1)
-			written, downloadErr := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress)
-			mu.Lock()
-			if err := out.Sync(); err != nil {
-				errs = append(errs, err)
-				cancel()
-			} else {
-				state.Received[index] += written
-				state.Done[index] = state.Received[index] == end-(int64(index)*chunk)+1
-			}
-			if err := writePartState(meta, state); err != nil {
-				errs = append(errs, err)
-				cancel()
-			}
-			if downloadErr != nil {
-				errs = append(errs, downloadErr)
-				cancel()
-			}
-			mu.Unlock()
-		}(i, start, end)
 	}
+	jobs := make(chan int)
+	for range connections {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				partStart := int64(index) * chunk
+				start := partStart + state.Received[index]
+				end := min(partStart+chunk, f.Size) - 1
+				if err := acquire(ctx, slots); err != nil {
+					mu.Lock()
+					errs = append(errs, err)
+					mu.Unlock()
+					return
+				}
+				progress.connection(1)
+				written, downloadErr := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress)
+				progress.connection(-1)
+				release(slots)
+				mu.Lock()
+				if err := out.Sync(); err != nil {
+					errs = append(errs, err)
+					cancel()
+				} else {
+					state.Received[index] += written
+					state.Done[index] = state.Received[index] == end-partStart+1
+				}
+				if err := writePartState(meta, state); err != nil {
+					errs = append(errs, err)
+					cancel()
+				}
+				if downloadErr != nil {
+					errs = append(errs, downloadErr)
+					cancel()
+				}
+				mu.Unlock()
+				if downloadErr != nil {
+					return
+				}
+			}
+		}()
+	}
+	for _, i := range pending {
+		select {
+		case jobs <- i:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			if len(errs) > 0 {
+				return errors.Join(errs...)
+			}
+			return ctx.Err()
+		}
+	}
+	close(jobs)
 	wg.Wait()
 	if len(errs) > 0 {
 		return errors.Join(errs...)
