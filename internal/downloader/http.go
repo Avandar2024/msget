@@ -18,7 +18,13 @@ const (
 	NetworkIPv4 = "ipv4"
 	NetworkIPv6 = "ipv6"
 	NetworkDual = "dual"
+
+	slowConnectionWindow = 3 * time.Second
+	slowConnectionRatio  = 0.3
+	connectionStagger    = 150 * time.Millisecond
 )
+
+var errSlowConnection = errors.New("connection is substantially slower than available routes")
 
 func (d *Downloader) client() *http.Client {
 	if d.Client != nil {
@@ -33,14 +39,14 @@ func (d *Downloader) client() *http.Client {
 	if connectTimeout <= 0 || connectTimeout > 30*time.Second {
 		connectTimeout = 30 * time.Second
 	}
-	newTransport := func(network string) *http.Transport {
+	newTransport := func(network string, forceHTTP2 bool) *http.Transport {
 		dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 		return &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
 				return dialer.DialContext(ctx, network, address)
 			},
-			ForceAttemptHTTP2:     true,
+			ForceAttemptHTTP2:     forceHTTP2,
 			MaxIdleConns:          max(16, workers*2),
 			MaxIdleConnsPerHost:   workers,
 			MaxConnsPerHost:       workers,
@@ -53,16 +59,14 @@ func (d *Downloader) client() *http.Client {
 	var transport http.RoundTripper
 	switch d.Network {
 	case NetworkIPv4:
-		transport = newTransport("tcp4")
+		transport = newTransport("tcp4", true)
 	case NetworkIPv6:
-		transport = newTransport("tcp6")
-	case NetworkDual:
-		transport = &dualTransport{transports: [2]http.RoundTripper{newTransport("tcp4"), newTransport("tcp6")}}
-	case "":
+		transport = newTransport("tcp6", true)
+	case NetworkDual, "":
 		// Dual is the library default as well as the CLI default.
-		transport = &dualTransport{transports: [2]http.RoundTripper{newTransport("tcp4"), newTransport("tcp6")}}
+		transport = &dualTransport{transports: [2]http.RoundTripper{newTransport("tcp4", false), newTransport("tcp6", false)}}
 	default:
-		transport = newTransport("tcp")
+		transport = newTransport("tcp", true)
 	}
 	return &http.Client{Transport: transport}
 }
@@ -71,19 +75,20 @@ func (d *Downloader) client() *http.Client {
 // weighted by each family's measured response throughput, with occasional
 // probes and connection-error fallback for incomplete dual-stack hosts.
 type dualTransport struct {
-	transports [2]http.RoundTripper
-	mu         sync.Mutex
-	next       uint64
-	rate       [2]float64
-	samples    [2]uint64
-	failures   [2]uint64
+	transports  [2]http.RoundTripper
+	mu          sync.Mutex
+	next        uint64
+	rate        [2]float64
+	samples     [2]uint64
+	failures    [2]uint64
+	connections uint64
 }
 
 func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	first := t.choose()
-	resp, err := t.transports[first].RoundTrip(req)
+	resp, cancel, err := t.roundTrip(first, req)
 	if err == nil {
-		resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: first, owner: t}
+		resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: first, owner: t, cancel: cancel}
 		return resp, nil
 	}
 	t.recordFailure(first)
@@ -94,13 +99,43 @@ func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Body != nil {
 		retry.Body, _ = req.GetBody()
 	}
-	resp, retryErr := t.transports[1-first].RoundTrip(retry)
+	resp, cancel, retryErr := t.roundTrip(1-first, retry)
 	if retryErr != nil {
 		t.recordFailure(1 - first)
 		return nil, errors.Join(err, retryErr)
 	}
-	resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: 1 - first, owner: t}
+	resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: 1 - first, owner: t, cancel: cancel}
 	return resp, nil
+}
+
+func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response, context.CancelFunc, error) {
+	ctx, cancel := context.WithCancel(req.Context())
+	t.mu.Lock()
+	delay := time.Duration(t.connections%4) * connectionStagger
+	t.connections++
+	t.mu.Unlock()
+	timer := time.NewTimer(delay)
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+		cancel()
+		return nil, cancel, ctx.Err()
+	}
+	attempt := req.Clone(ctx)
+	// Establish each range request at a different time; dual-mode transports
+	// disable HTTP/2 so closing a slow body also retires its TCP connection.
+	attempt.Close = true
+	resp, err := t.transports[family].RoundTrip(attempt)
+	if err != nil {
+		cancel()
+	}
+	return resp, cancel, err
 }
 
 func (t *dualTransport) choose() int {
@@ -168,6 +203,17 @@ func (t *dualTransport) recordRate(family int, bytes int64, elapsed time.Duratio
 	t.mu.Unlock()
 }
 
+func (t *dualTransport) tooSlow(bytes int64, elapsed time.Duration) bool {
+	if bytes < 256<<10 || elapsed < slowConnectionWindow {
+		return false
+	}
+	current := float64(bytes) / elapsed.Seconds()
+	t.mu.Lock()
+	reference := max(t.rate[0], t.rate[1])
+	t.mu.Unlock()
+	return reference > 0 && current < reference*slowConnectionRatio
+}
+
 type measuredBody struct {
 	io.ReadCloser
 	started time.Time
@@ -175,11 +221,20 @@ type measuredBody struct {
 	owner   *dualTransport
 	bytes   int64
 	once    sync.Once
+	cancel  context.CancelFunc
+	aborted bool
 }
 
 func (b *measuredBody) Read(p []byte) (int, error) {
 	n, err := b.ReadCloser.Read(p)
 	b.bytes += int64(n)
+	if !b.aborted && b.owner.tooSlow(b.bytes, time.Since(b.started)) {
+		b.aborted = true
+		b.owner.recordFailure(b.family)
+		b.cancel()
+		_ = b.ReadCloser.Close()
+		return n, errSlowConnection
+	}
 	if err == io.EOF {
 		b.Close()
 	}
@@ -188,7 +243,12 @@ func (b *measuredBody) Read(p []byte) (int, error) {
 
 func (b *measuredBody) Close() error {
 	err := b.ReadCloser.Close()
-	b.once.Do(func() { b.owner.recordRate(b.family, b.bytes, time.Since(b.started)) })
+	b.cancel()
+	b.once.Do(func() {
+		if !b.aborted {
+			b.owner.recordRate(b.family, b.bytes, time.Since(b.started))
+		}
+	})
 	return err
 }
 

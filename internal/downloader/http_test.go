@@ -178,6 +178,46 @@ func TestDualTransportUsesMeasuredRate(t *testing.T) {
 	}
 }
 
+func TestMeasuredBodyRejectsSlowConnection(t *testing.T) {
+	t.Parallel()
+	transport := &dualTransport{}
+	transport.recordRate(0, 40<<20, time.Second)
+	body := &measuredBody{
+		ReadCloser: io.NopCloser(bytes.NewReader(make([]byte, 512<<10))),
+		started:    time.Now().Add(-4 * time.Second),
+		family:     1,
+		owner:      transport,
+		cancel:     func() {},
+	}
+	buffer := make([]byte, 512<<10)
+	if _, err := body.Read(buffer); !errors.Is(err, errSlowConnection) {
+		t.Fatalf("Read() error = %v", err)
+	}
+}
+
+func TestDualTransportRequestsConnectionClose(t *testing.T) {
+	t.Parallel()
+	var closeRequested bool
+	transport := &dualTransport{transports: [2]http.RoundTripper{
+		roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			closeRequested = req.Close
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+		}),
+		roundTripperFunc(func(req *http.Request) (*http.Response, error) {
+			return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
+		}),
+	}}
+	req, _ := http.NewRequest(http.MethodGet, "https://example.test/file", nil)
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if !closeRequested {
+		t.Fatal("dual request did not require connection close")
+	}
+}
+
 func TestDefaultNetworkIsDual(t *testing.T) {
 	t.Parallel()
 	if _, ok := (&Downloader{}).client().Transport.(*dualTransport); !ok {

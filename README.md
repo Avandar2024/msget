@@ -31,10 +31,15 @@ Run the same checks used by CI locally:
 ```bash
 make check
 make coverage
+make benchmark
 ```
 
 The check target verifies formatting, runs `go vet`, and executes the test suite
 with the race detector. The coverage target enforces a 75% statement coverage floor.
+The benchmark performs a synthetic 256 MiB parallel download through the real
+range scheduler, disk writer, and checkpoint path. Compare its `MB/s` and
+`ns/op` output before and after experimental changes; five runs are emitted by
+default to make noise visible.
 
 ## Usage
 
@@ -77,6 +82,10 @@ assigns requests according to their measured recent throughput:
 The first requests probe both families; subsequent requests use an EWMA of
 bytes per second to favor the faster route. If one address family cannot
 connect, that request falls back to the other.
+For unstable gateways, dual mode also staggers new range connections
+across a 450 ms window; once there is enough history, a connection sustaining less
+than 30% of the best recent route for three seconds is retired and its range
+resumes on a new connection.
 Use `-network ipv4` or `-network ipv6` to force one family. The default is
 `-network dual`; pass `-network auto` to use Go's normal Happy Eyeballs
 selection. Dual mode improves throughput only when the two routes have

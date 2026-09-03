@@ -7,7 +7,10 @@ GCFLAGS := all=-l
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
 BUILD_FLAGS := -trimpath -buildvcs=false -gcflags "$(GCFLAGS)" -ldflags "$(LDFLAGS)"
 
-.PHONY: all build build-linux-amd64 test check coverage clean
+.PHONY: all build build-linux-amd64 test check coverage benchmark clean
+
+BENCH_TIME ?= 1x
+BENCH_COUNT ?= 5
 
 all: check build
 
@@ -31,6 +34,9 @@ coverage:
 	go test -coverprofile=coverage.out ./...
 	go tool cover -func=coverage.out
 	@go tool cover -func=coverage.out | awk '/^total:/ { gsub(/%/, "", $$3); if ($$3 < 75) { print "coverage " $$3 "% is below 75%"; exit 1 } }'
+
+benchmark:
+	go test ./internal/downloader -run '^$$' -bench '^BenchmarkParallelDownload$$' -benchmem -benchtime=$(BENCH_TIME) -count=$(BENCH_COUNT)
 
 clean:
 	rm -rf $(BIN_DIR) coverage.out

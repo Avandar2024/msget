@@ -48,6 +48,7 @@ func main() {
 	output := flag.String("o", "", "output directory (default: model name)")
 	revision := flag.String("revision", "master", "branch, tag, or commit")
 	network := flag.String("network", downloader.NetworkDual, "connection family: auto, ipv4, ipv6, or dual")
+
 	showVersion := flag.Bool("version", false, "show version")
 	flag.Var(&includes, "include", "download only files matching this glob (repeatable)")
 	flag.Var(&excludes, "exclude", "exclude files matching this glob (repeatable)")
