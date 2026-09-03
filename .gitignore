@@ -1,3 +1,5 @@
 /msget
 /msget-*
 *.part
+/coverage.out
+/bin/

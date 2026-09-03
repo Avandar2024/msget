@@ -7,14 +7,29 @@ A ModelScope model downloader using only the Go standard library. It builds as a
 Go 1.22 or newer is required:
 
 ```bash
-go build -o msget .
+make build
 ```
+
+The executable is written to `bin/msget`. Set `VERSION` to embed a release
+version, for example `make build VERSION=v1.2.0`.
 
 Cross-compilation is also supported:
 
 ```bash
-GOOS=linux GOARCH=amd64 go build -o msget-linux-amd64 .
+make build-linux-amd64
 ```
+
+## Development
+
+Run the same checks used by CI locally:
+
+```bash
+make check
+make coverage
+```
+
+The check target verifies formatting, runs `go vet`, and executes the test suite
+with the race detector. The coverage target enforces a 75% statement coverage floor.
 
 ## Usage
 

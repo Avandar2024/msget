@@ -11,6 +11,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/jiyuren/msget/internal/downloader"
 )
 
 var version = "dev"
@@ -68,9 +70,10 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workers := min(8, max(2, runtime.NumCPU()))
-	d := Downloader{
+	d := downloader.Downloader{
 		Endpoint:        strings.TrimRight(envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), "/"),
 		Token:           os.Getenv("MODELSCOPE_API_TOKEN"),
+		UserAgent:       "msget/" + version,
 		Workers:         workers,
 		Parts:           min(4, workers),
 		Retries:         5,

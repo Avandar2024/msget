@@ -1,19 +1,15 @@
-package main
+package downloader
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -23,6 +19,7 @@ import (
 type Downloader struct {
 	Endpoint        string
 	Token           string
+	UserAgent       string
 	Workers         int
 	Parts           int
 	Retries         int
@@ -325,72 +322,6 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 
 var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
-type partState struct {
-	Version   int     `json:"version"`
-	Repo      string  `json:"repo"`
-	Revision  string  `json:"revision"`
-	Path      string  `json:"path"`
-	SHA256    string  `json:"sha256,omitempty"`
-	Size      int64   `json:"size"`
-	Parts     int     `json:"parts"`
-	Validator string  `json:"validator,omitempty"`
-	Done      []bool  `json:"done,omitempty"`
-	Received  []int64 `json:"received,omitempty"`
-}
-
-func newPartState(repo, revision string, f repoFile, parts int) partState {
-	return partState{Version: 1, Repo: repo, Revision: revision, Path: f.Path, SHA256: f.SHA256, Size: f.Size, Parts: parts, Done: make([]bool, parts), Received: make([]int64, parts)}
-}
-
-func loadMatchingPartState(path string, expected partState, dst *partState) bool {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var saved partState
-	if json.Unmarshal(data, &saved) != nil || saved.Version != expected.Version || saved.Repo != expected.Repo || saved.Revision != expected.Revision || saved.Path != expected.Path || saved.SHA256 != expected.SHA256 || saved.Size != expected.Size || saved.Parts != expected.Parts || len(saved.Done) != expected.Parts {
-		return false
-	}
-	if len(saved.Received) != expected.Parts {
-		saved.Received = make([]int64, expected.Parts)
-	}
-	if dst != nil {
-		*dst = saved
-	}
-	return true
-}
-
-func writePartState(path string, state partState) error {
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-	err = json.NewEncoder(f).Encode(state)
-	if err == nil {
-		err = f.Sync()
-	}
-	if closeErr := f.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		return err
-	}
-	dir, err := os.Open(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	err = dir.Sync()
-	if closeErr := dir.Close(); err == nil {
-		err = closeErr
-	}
-	return err
-}
-
 func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}, fileProgress *fileProgress, progress *downloadProgress) error {
 	parts := min(d.Parts, int((f.Size+(8<<20)-1)/(8<<20)))
 	if parts < 2 {
@@ -540,80 +471,6 @@ func release(slots chan struct{}) {
 	}
 }
 
-func (d *Downloader) validExisting(path string, f repoFile) (bool, error) {
-	st, err := os.Stat(path)
-	if err != nil {
-		return false, err
-	}
-	if f.Size > 0 && st.Size() != f.Size {
-		return false, nil
-	}
-	if !d.Verify || f.SHA256 == "" {
-		return true, nil
-	}
-	return hashMatches(path, f.SHA256)
-}
-
-func verifyFile(path string, f repoFile, verify bool) error {
-	st, err := os.Stat(path)
-	if err != nil {
-		return err
-	}
-	if f.Size > 0 && st.Size() != f.Size {
-		return fmt.Errorf("incomplete file: got %d bytes, expected %d", st.Size(), f.Size)
-	}
-	if verify && f.SHA256 != "" {
-		ok, err := hashMatches(path, f.SHA256)
-		if err != nil {
-			return err
-		}
-		if !ok {
-			return errors.New("SHA-256 verification failed")
-		}
-	}
-	return nil
-}
-
-func hashMatches(path, expected string) (bool, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-	h := sha256.New()
-	if _, err := io.CopyBuffer(h, f, make([]byte, 1<<20)); err != nil {
-		return false, err
-	}
-	return strings.EqualFold(hex.EncodeToString(h.Sum(nil)), expected), nil
-}
-
-func (d *Downloader) client() *http.Client {
-	if d.Client != nil {
-		return d.Client
-	}
-	workers := max(1, d.Workers)
-	idleTimeout := d.IdleConnTimeout
-	if idleTimeout <= 0 {
-		idleTimeout = 90 * time.Second
-	}
-	connectTimeout := d.Timeout
-	if connectTimeout <= 0 || connectTimeout > 30*time.Second {
-		connectTimeout = 30 * time.Second
-	}
-	return &http.Client{Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          max(16, workers*2),
-		MaxIdleConnsPerHost:   workers,
-		MaxConnsPerHost:       workers,
-		IdleConnTimeout:       idleTimeout,
-		TLSHandshakeTimeout:   min(10*time.Second, connectTimeout),
-		ResponseHeaderTimeout: d.Timeout,
-		ExpectContinueTimeout: time.Second,
-	}}
-}
-
 type activityReader struct {
 	r       io.Reader
 	timer   *time.Timer
@@ -630,109 +487,4 @@ func (r *activityReader) Read(p []byte) (int, error) {
 		}
 	}
 	return n, err
-}
-func (d *Downloader) writer() io.Writer {
-	if d.Out != nil {
-		return d.Out
-	}
-	return io.Discard
-}
-func (d *Downloader) headers(req *http.Request) {
-	req.Header.Set("User-Agent", "msget/"+version)
-	if d.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+d.Token)
-		req.Header.Set("X-ModelScope-Token", d.Token)
-	}
-}
-
-func responseError(action string, resp *http.Response) error {
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-	message := strings.TrimSpace(string(body))
-	if message == "" {
-		message = resp.Status
-	}
-	return fmt.Errorf("%s: HTTP %d: %s", action, resp.StatusCode, message)
-}
-
-func validateRepo(repo string) error {
-	parts := strings.Split(repo, "/")
-	if len(parts) < 2 {
-		return errors.New("model ID must be namespace/model, for example Qwen/Qwen3-0.6B")
-	}
-	for _, p := range parts {
-		if p == "" || p == "." || p == ".." {
-			return errors.New("invalid model ID")
-		}
-	}
-	return nil
-}
-func escapeRepo(repo string) string {
-	parts := strings.Split(repo, "/")
-	for i := range parts {
-		parts[i] = url.PathEscape(parts[i])
-	}
-	return strings.Join(parts, "/")
-}
-func safeTarget(root, remote string) (string, error) {
-	remote = strings.ReplaceAll(remote, "\\", "/")
-	clean := filepath.Clean(filepath.FromSlash(remote))
-	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes output directory")
-	}
-	target := filepath.Join(root, clean)
-	rel, err := filepath.Rel(root, target)
-	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("path escapes output directory")
-	}
-	return target, nil
-}
-func selectedBy(name string, includes, excludes []string) bool {
-	if len(includes) > 0 && !matchesAny(name, includes) {
-		return false
-	}
-	return !matchesAny(name, excludes)
-}
-func matchesAny(name string, patterns []string) bool {
-	for _, pattern := range patterns {
-		re, err := regexp.Compile(globRegexp(pattern))
-		if err == nil && re.MatchString(name) {
-			return true
-		}
-	}
-	return false
-}
-func globRegexp(glob string) string {
-	var b strings.Builder
-	b.WriteByte('^')
-	for i := 0; i < len(glob); i++ {
-		switch glob[i] {
-		case '*':
-			if i+1 < len(glob) && glob[i+1] == '*' {
-				b.WriteString(".*")
-				i++
-			} else {
-				b.WriteString("[^/]*")
-			}
-		case '?':
-			b.WriteString("[^/]")
-		case '/':
-			b.WriteByte('/')
-		default:
-			b.WriteString(regexp.QuoteMeta(string(glob[i])))
-		}
-	}
-	b.WriteByte('$')
-	return b.String()
-}
-func humanBytes(n int64) string {
-	const unit = int64(1024)
-	if n < unit {
-		return fmt.Sprintf("%d B", n)
-	}
-	div, exp := unit, 0
-	for value := n / unit; value >= unit && exp < 5; value /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %ciB", float64(n)/float64(div), "KMGTPE"[exp])
 }

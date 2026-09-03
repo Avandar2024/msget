@@ -1,4 +1,4 @@
-package main
+package downloader
 
 import (
 	"context"
@@ -44,6 +44,60 @@ func TestDownload(t *testing.T) {
 	}
 	if string(got) != string(body) {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestListErrors(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name   string
+		status int
+		body   string
+		want   string
+	}{
+		{name: "HTTP error", status: http.StatusUnauthorized, body: "token required", want: "HTTP 401"},
+		{name: "invalid JSON", status: http.StatusOK, body: "not json", want: "decode file list"},
+		{name: "API error", status: http.StatusOK, body: `{"Code":500,"Message":"backend failed"}`, want: "backend failed"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(tt.status)
+				_, _ = io.WriteString(w, tt.body)
+			}))
+			defer server.Close()
+			d := Downloader{Endpoint: server.URL, Client: server.Client()}
+			_, err := d.list(context.Background(), "org/model", "main")
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("list() error = %v, want substring %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestDownloadReportsNoMatchingFiles(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"Code":200,"Data":{"Files":[{"Path":"model.bin","Type":"blob","Size":10}]}}`)
+	}))
+	defer server.Close()
+	d := Downloader{Endpoint: server.URL, Client: server.Client()}
+	err := d.Download(context.Background(), "org/model", "main", t.TempDir(), []string{"*.json"}, nil)
+	if err == nil || !strings.Contains(err.Error(), "no model files matched") {
+		t.Fatalf("Download() error = %v", err)
+	}
+}
+
+func TestDownloadRejectsUnsafeServerPath(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `{"Code":200,"Data":{"Files":[{"Path":"../escape","Type":"blob","Size":1}]}}`)
+	}))
+	defer server.Close()
+	d := Downloader{Endpoint: server.URL, Client: server.Client()}
+	err := d.Download(context.Background(), "org/model", "main", t.TempDir(), nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "unsafe path") {
+		t.Fatalf("Download() error = %v", err)
 	}
 }
 
