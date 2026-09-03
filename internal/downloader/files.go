@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -82,36 +81,45 @@ func selectedBy(name string, includes, excludes []string) bool {
 
 func matchesAny(name string, patterns []string) bool {
 	for _, pattern := range patterns {
-		re, err := regexp.Compile(globRegexp(pattern))
-		if err == nil && re.MatchString(name) {
+		if globMatch(pattern, name) {
 			return true
 		}
 	}
 	return false
 }
 
-func globRegexp(glob string) string {
-	var b strings.Builder
-	b.WriteByte('^')
-	for i := 0; i < len(glob); i++ {
-		switch glob[i] {
-		case '*':
-			if i+1 < len(glob) && glob[i+1] == '*' {
-				b.WriteString(".*")
-				i++
-			} else {
-				b.WriteString("[^/]*")
-			}
-		case '?':
-			b.WriteString("[^/]")
-		case '/':
-			b.WriteByte('/')
-		default:
-			b.WriteString(regexp.QuoteMeta(string(glob[i])))
+func globMatch(pattern, name string) bool {
+	p, s := []rune(pattern), []rune(name)
+	type position struct{ pattern, name int }
+	seen := make(map[position]bool)
+	failed := make(map[position]bool)
+	var match func(int, int) bool
+	match = func(pi, si int) bool {
+		pos := position{pi, si}
+		if seen[pos] {
+			return !failed[pos]
 		}
+		seen[pos] = true
+		ok := false
+		switch {
+		case pi == len(p):
+			ok = si == len(s)
+		case p[pi] == '*':
+			double := pi+1 < len(p) && p[pi+1] == '*'
+			next := pi + 1
+			if double {
+				next++
+			}
+			ok = match(next, si) || si < len(s) && (double || s[si] != '/') && match(pi, si+1)
+		case si < len(s) && p[pi] == '?' && s[si] != '/':
+			ok = match(pi+1, si+1)
+		case si < len(s) && p[pi] == s[si]:
+			ok = match(pi+1, si+1)
+		}
+		failed[pos] = !ok
+		return ok
 	}
-	b.WriteByte('$')
-	return b.String()
+	return match(0, 0)
 }
 
 func humanBytes(n int64) string {

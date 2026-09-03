@@ -61,17 +61,22 @@ func TestValidExisting(t *testing.T) {
 func TestGlobPatterns(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
-		name, pattern string
-		want          bool
+		name, input, pattern string
+		want                 bool
 	}{
-		{name: "single star", pattern: "*.json", want: false},
-		{name: "double star", pattern: "**/*.json", want: true},
-		{name: "question mark", pattern: "dir/a.jso?", want: true},
-		{name: "literal punctuation", pattern: "dir/a.json", want: true},
+		{name: "single star", input: "dir/a.json", pattern: "*.json", want: false},
+		{name: "double star", input: "dir/a.json", pattern: "**/*.json", want: true},
+		{name: "question mark", input: "dir/a.json", pattern: "dir/a.jso?", want: true},
+		{name: "literal punctuation", input: "dir/a.json", pattern: "dir/a.json", want: true},
+		{name: "star within segment", input: "dir/a.json", pattern: "dir/*.json", want: true},
+		{name: "star cannot cross slash", input: "dir/a.json", pattern: "dir*json", want: false},
+		{name: "double star crosses slash", input: "dir/a.json", pattern: "**json", want: true},
+		{name: "question cannot cross slash", input: "dir/a.json", pattern: "dir?a.json", want: false},
+		{name: "unicode question", input: "dir/模.json", pattern: "dir/?.json", want: true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := matchesAny("dir/a.json", []string{tt.pattern}); got != tt.want {
+			if got := matchesAny(tt.input, []string{tt.pattern}); got != tt.want {
 				t.Fatalf("matchesAny() = %v, want %v", got, tt.want)
 			}
 		})
