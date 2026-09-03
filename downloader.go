@@ -219,9 +219,20 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	if st, err := os.Stat(part); err == nil {
 		offset = st.Size()
 	}
+	state := newPartState(repo, revision, f, 1)
+	meta := part + ".meta"
+	if offset > 0 {
+		if !loadMatchingPartState(meta, state, &state) {
+			_ = os.Remove(part)
+			offset = 0
+		}
+	}
 	if f.Size > 0 && offset > f.Size {
 		_ = os.Remove(part)
 		offset = 0
+	}
+	if err := writePartState(meta, state); err != nil {
+		return fmt.Errorf("保存续传状态: %w", err)
 	}
 	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo"
 	q := url.Values{"Revision": {revision}, "FilePath": {f.Path}}
@@ -236,16 +247,31 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	d.headers(req)
 	if offset > 0 {
 		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+		if state.Validator != "" {
+			req.Header.Set("If-Range", state.Validator)
+		}
 	}
 	resp, err := d.client().Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable && f.Size > 0 && offset == f.Size {
+		return nil
+	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return responseError("下载", resp)
 	}
-	appendMode := offset > 0 && (resp.StatusCode == http.StatusPartialContent || strings.HasPrefix(resp.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", offset)))
+	appendMode := offset > 0 && resp.StatusCode == http.StatusPartialContent && validContentRange(resp.Header.Get("Content-Range"), offset, f.Size)
+	if offset > 0 && resp.StatusCode == http.StatusPartialContent && !appendMode {
+		return fmt.Errorf("服务端返回了不匹配的 Content-Range: %q", resp.Header.Get("Content-Range"))
+	}
+	if validator := responseValidator(resp); validator != "" && validator != state.Validator {
+		state.Validator = validator
+		if err := writePartState(meta, state); err != nil {
+			return fmt.Errorf("保存续传状态: %w", err)
+		}
+	}
 	flags := os.O_CREATE | os.O_WRONLY
 	if appendMode {
 		flags |= os.O_APPEND
@@ -259,9 +285,13 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	}
 	reader := &activityReader{r: resp.Body, timer: timer, timeout: d.Timeout}
 	_, copyErr := io.CopyBuffer(out, reader, make([]byte, 1<<20))
+	syncErr := out.Sync()
 	closeErr := out.Close()
 	if copyErr != nil {
 		return copyErr
+	}
+	if syncErr != nil {
+		return syncErr
 	}
 	return closeErr
 }
@@ -269,8 +299,65 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 var errRangeUnsupported = errors.New("服务器不支持分片下载")
 
 type partState struct {
-	Size int64  `json:"size"`
-	Done []bool `json:"done"`
+	Version   int    `json:"version"`
+	Repo      string `json:"repo"`
+	Revision  string `json:"revision"`
+	Path      string `json:"path"`
+	SHA256    string `json:"sha256,omitempty"`
+	Size      int64  `json:"size"`
+	Parts     int    `json:"parts"`
+	Validator string `json:"validator,omitempty"`
+	Done      []bool `json:"done,omitempty"`
+}
+
+func newPartState(repo, revision string, f repoFile, parts int) partState {
+	return partState{Version: 1, Repo: repo, Revision: revision, Path: f.Path, SHA256: f.SHA256, Size: f.Size, Parts: parts, Done: make([]bool, parts)}
+}
+
+func loadMatchingPartState(path string, expected partState, dst *partState) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var saved partState
+	if json.Unmarshal(data, &saved) != nil || saved.Version != expected.Version || saved.Repo != expected.Repo || saved.Revision != expected.Revision || saved.Path != expected.Path || saved.SHA256 != expected.SHA256 || saved.Size != expected.Size || saved.Parts != expected.Parts || len(saved.Done) != expected.Parts {
+		return false
+	}
+	if dst != nil {
+		*dst = saved
+	}
+	return true
+}
+
+func writePartState(path string, state partState) error {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	err = json.NewEncoder(f).Encode(state)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	dir, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	err = dir.Sync()
+	if closeErr := dir.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }
 
 func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}) error {
@@ -278,23 +365,21 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	if parts < 2 {
 		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
 	}
-	state := partState{Size: f.Size, Done: make([]bool, parts)}
+	state := newPartState(repo, revision, f, parts)
 	meta := part + ".meta"
-	if data, err := os.ReadFile(meta); err == nil {
-		var saved partState
-		if json.Unmarshal(data, &saved) == nil && saved.Size == f.Size && len(saved.Done) == parts {
-			state = saved
-		}
-	}
+	matched := loadMatchingPartState(meta, state, &state)
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
-	if st, err := out.Stat(); err != nil || st.Size() != f.Size {
+	if st, err := out.Stat(); err != nil || st.Size() != f.Size || !matched {
 		state.Done = make([]bool, parts)
 		if err := out.Truncate(f.Size); err != nil {
 			return err
+		}
+		if err := writePartState(meta, state); err != nil {
+			return fmt.Errorf("保存续传状态: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -327,11 +412,17 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 				return
 			}
 			mu.Lock()
-			state.Done[index] = true
-			data, _ := json.Marshal(state)
-			if err := os.WriteFile(meta, data, 0o644); err != nil {
+			if err := out.Sync(); err != nil {
 				errs = append(errs, err)
 				cancel()
+			} else {
+				state.Done[index] = true
+			}
+			if len(errs) == 0 {
+				if err := writePartState(meta, state); err != nil {
+					errs = append(errs, err)
+					cancel()
+				}
 			}
 			mu.Unlock()
 		}(i, start, end)
@@ -341,6 +432,21 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 		return errors.Join(errs...)
 	}
 	return out.Sync()
+}
+
+func responseValidator(resp *http.Response) string {
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		return etag
+	}
+	return resp.Header.Get("Last-Modified")
+}
+
+func validContentRange(value string, offset, size int64) bool {
+	var start, end, total int64
+	if _, err := fmt.Sscanf(value, "bytes %d-%d/%d", &start, &end, &total); err != nil {
+		return false
+	}
+	return start == offset && end >= start && (size <= 0 || total == size)
 }
 
 func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64) error {
