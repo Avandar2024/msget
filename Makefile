@@ -2,7 +2,10 @@ APP := msget
 CMD := ./cmd/msget
 BIN_DIR := bin
 VERSION ?= dev
-LDFLAGS := -s -w -X main.version=$(VERSION)
+CGO_ENABLED ?= 0
+GCFLAGS := all=-l
+LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
+BUILD_FLAGS := -trimpath -buildvcs=false -gcflags "$(GCFLAGS)" -ldflags "$(LDFLAGS)"
 
 .PHONY: all build build-linux-amd64 test check coverage clean
 
@@ -10,11 +13,11 @@ all: check build
 
 build:
 	mkdir -p $(BIN_DIR)
-	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP) $(CMD)
+	CGO_ENABLED=$(CGO_ENABLED) go build $(BUILD_FLAGS) -o $(BIN_DIR)/$(APP) $(CMD)
 
 build-linux-amd64:
 	mkdir -p $(BIN_DIR)
-	GOOS=linux GOARCH=amd64 go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN_DIR)/$(APP)-linux-amd64 $(CMD)
+	CGO_ENABLED=$(CGO_ENABLED) GOOS=linux GOARCH=amd64 go build $(BUILD_FLAGS) -o $(BIN_DIR)/$(APP)-linux-amd64 $(CMD)
 
 test:
 	go test ./...
