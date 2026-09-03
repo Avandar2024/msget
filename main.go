@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -45,13 +44,6 @@ func main() {
 	var includes, excludes stringList
 	output := flag.String("o", "", "输出目录（默认取模型名称）")
 	revision := flag.String("revision", "master", "分支、标签或提交")
-	workers := flag.Int("workers", min(8, max(2, runtime.NumCPU())), "最大并发下载连接数")
-	parts := flag.Int("parts", 4, "大文件并行分片数（总连接数仍受 workers 限制）")
-	retries := flag.Int("retries", 5, "每个文件的重试次数")
-	timeout := flag.Duration("timeout", 60*time.Second, "连接或连续无数据超时")
-	endpoint := flag.String("endpoint", envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), "ModelScope 服务地址")
-	token := flag.String("token", os.Getenv("MODELSCOPE_API_TOKEN"), "访问令牌（也可用 MODELSCOPE_API_TOKEN）")
-	verify := flag.Bool("verify", true, "校验文件 SHA-256")
 	showVersion := flag.Bool("version", false, "显示版本")
 	flag.Var(&includes, "include", "只下载匹配 glob 的文件，可重复")
 	flag.Var(&excludes, "exclude", "排除匹配 glob 的文件，可重复")
@@ -66,10 +58,6 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if *workers < 1 || *parts < 1 || *retries < 0 || *timeout <= 0 {
-		fatal(errors.New("workers 和 parts 必须大于 0，retries 不能为负，timeout 必须大于 0"))
-	}
-
 	repo := flag.Arg(0)
 	if *output == "" {
 		parts := strings.Split(strings.Trim(repo, "/"), "/")
@@ -78,10 +66,17 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	workers := min(8, max(2, runtime.NumCPU()))
 	d := Downloader{
-		Endpoint: strings.TrimRight(*endpoint, "/"), Token: *token,
-		Workers: *workers, Parts: *parts, Retries: *retries, Timeout: *timeout, Verify: *verify,
-		Out: os.Stderr,
+		Endpoint:        strings.TrimRight(envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), "/"),
+		Token:           os.Getenv("MODELSCOPE_API_TOKEN"),
+		Workers:         workers,
+		Parts:           min(4, workers),
+		Retries:         5,
+		Timeout:         60 * time.Second,
+		IdleConnTimeout: 90 * time.Second,
+		Verify:          true,
+		Out:             os.Stderr,
 	}
 	if err := d.Download(ctx, repo, *revision, *output, includes, excludes); err != nil {
 		fatal(err)

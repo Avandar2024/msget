@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -20,15 +21,16 @@ import (
 )
 
 type Downloader struct {
-	Endpoint string
-	Token    string
-	Workers  int
-	Parts    int
-	Retries  int
-	Timeout  time.Duration
-	Verify   bool
-	Out      io.Writer
-	Client   *http.Client
+	Endpoint        string
+	Token           string
+	Workers         int
+	Parts           int
+	Retries         int
+	Timeout         time.Duration
+	IdleConnTimeout time.Duration
+	Verify          bool
+	Out             io.Writer
+	Client          *http.Client
 }
 
 type repoFile struct {
@@ -53,6 +55,7 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 	copy := *d
 	if copy.Client == nil {
 		copy.Client = copy.client()
+		defer copy.Client.CloseIdleConnections()
 	}
 	d = &copy
 	if err := validateRepo(repo); err != nil {
@@ -575,10 +578,26 @@ func (d *Downloader) client() *http.Client {
 	if d.Client != nil {
 		return d.Client
 	}
+	workers := max(1, d.Workers)
+	idleTimeout := d.IdleConnTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = 90 * time.Second
+	}
+	connectTimeout := d.Timeout
+	if connectTimeout <= 0 || connectTimeout > 30*time.Second {
+		connectTimeout = 30 * time.Second
+	}
 	return &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          max(16, workers*2),
+		MaxIdleConnsPerHost:   workers,
+		MaxConnsPerHost:       workers,
+		IdleConnTimeout:       idleTimeout,
+		TLSHandshakeTimeout:   min(10*time.Second, connectTimeout),
 		ResponseHeaderTimeout: d.Timeout,
-		MaxIdleConnsPerHost:   max(2, d.Workers),
+		ExpectContinueTimeout: time.Second,
 	}}
 }
 

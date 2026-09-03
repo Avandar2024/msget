@@ -235,3 +235,24 @@ func TestPatterns(t *testing.T) {
 		t.Fatal("exclude did not match")
 	}
 }
+
+func TestHTTPTransportPool(t *testing.T) {
+	d := Downloader{Workers: 7, Timeout: 45 * time.Second, IdleConnTimeout: 2 * time.Minute}
+	client := d.client()
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("transport type = %T", client.Transport)
+	}
+	if transport.MaxConnsPerHost != 7 || transport.MaxIdleConnsPerHost != 7 {
+		t.Fatalf("per-host limits = active %d, idle %d", transport.MaxConnsPerHost, transport.MaxIdleConnsPerHost)
+	}
+	if transport.MaxIdleConns != 16 {
+		t.Fatalf("MaxIdleConns = %d", transport.MaxIdleConns)
+	}
+	if transport.IdleConnTimeout != 2*time.Minute {
+		t.Fatalf("IdleConnTimeout = %s", transport.IdleConnTimeout)
+	}
+	if transport.DialContext == nil || !transport.ForceAttemptHTTP2 {
+		t.Fatal("TCP dialer or HTTP/2 was not configured")
+	}
+}
