@@ -23,6 +23,7 @@ type Downloader struct {
 	Endpoint string
 	Token    string
 	Workers  int
+	Parts    int
 	Retries  int
 	Timeout  time.Duration
 	Verify   bool
@@ -47,6 +48,13 @@ type listResponse struct {
 }
 
 func (d *Downloader) Download(ctx context.Context, repo, revision, output string, includes, excludes []string) error {
+	// Use one transport for the whole download. Besides connection reuse, this also
+	// makes the global request limit below describe actual network concurrency.
+	copy := *d
+	if copy.Client == nil {
+		copy.Client = copy.client()
+	}
+	d = &copy
 	if err := validateRepo(repo); err != nil {
 		return err
 	}
@@ -80,6 +88,7 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 	fmt.Fprintf(d.writer(), "模型 %s@%s：%d 个文件，%s -> %s\n", repo, revision, len(selected), humanBytes(total), root)
 
 	jobs := make(chan repoFile)
+	slots := make(chan struct{}, d.Workers)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var failures []error
@@ -88,7 +97,7 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		go func() {
 			defer wg.Done()
 			for f := range jobs {
-				if err := d.downloadFile(ctx, repo, revision, root, f); err != nil {
+				if err := d.downloadFile(ctx, repo, revision, root, f, slots); err != nil {
 					mu.Lock()
 					failures = append(failures, fmt.Errorf("%s: %w", f.Path, err))
 					fmt.Fprintf(d.writer(), "失败  %s: %v\n", f.Path, err)
@@ -145,7 +154,7 @@ func (d *Downloader) list(ctx context.Context, repo, revision string) ([]repoFil
 	return result.Data.Files, nil
 }
 
-func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root string, f repoFile) error {
+func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root string, f repoFile, slots chan struct{}) error {
 	target, err := safeTarget(root, f.Path)
 	if err != nil {
 		return err
@@ -167,24 +176,45 @@ func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root stri
 				return ctx.Err()
 			}
 		}
-		if err := d.downloadAttempt(ctx, repo, revision, part, f); err != nil {
-			last = err
+		var downloadErr error
+		if d.Parts > 1 && f.Size >= 8<<20 {
+			downloadErr = d.downloadParallel(ctx, repo, revision, part, f, slots)
+			if errors.Is(downloadErr, errRangeUnsupported) {
+				_ = os.Remove(part)
+				_ = os.Remove(part + ".meta")
+				downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+			}
+		} else {
+			downloadErr = d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+		}
+		if downloadErr != nil {
+			last = downloadErr
 			continue
 		}
 		if err := verifyFile(part, f, d.Verify); err != nil {
 			last = err
 			_ = os.Remove(part)
+			_ = os.Remove(part + ".meta")
 			continue
 		}
 		if err := os.Rename(part, target); err != nil {
 			return err
 		}
+		_ = os.Remove(part + ".meta")
 		return nil
 	}
 	return last
 }
 
 func (d *Downloader) downloadAttempt(ctx context.Context, repo, revision, part string, f repoFile) error {
+	return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, nil)
+}
+
+func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}) error {
+	if err := acquire(ctx, slots); err != nil {
+		return err
+	}
+	defer release(slots)
 	var offset int64
 	if st, err := os.Stat(part); err == nil {
 		offset = st.Size()
@@ -234,6 +264,132 @@ func (d *Downloader) downloadAttempt(ctx context.Context, repo, revision, part s
 		return copyErr
 	}
 	return closeErr
+}
+
+var errRangeUnsupported = errors.New("服务器不支持分片下载")
+
+type partState struct {
+	Size int64  `json:"size"`
+	Done []bool `json:"done"`
+}
+
+func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part string, f repoFile, slots chan struct{}) error {
+	parts := min(d.Parts, int((f.Size+(8<<20)-1)/(8<<20)))
+	if parts < 2 {
+		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots)
+	}
+	state := partState{Size: f.Size, Done: make([]bool, parts)}
+	meta := part + ".meta"
+	if data, err := os.ReadFile(meta); err == nil {
+		var saved partState
+		if json.Unmarshal(data, &saved) == nil && saved.Size == f.Size && len(saved.Done) == parts {
+			state = saved
+		}
+	}
+	out, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	if st, err := out.Stat(); err != nil || st.Size() != f.Size {
+		state.Done = make([]bool, parts)
+		if err := out.Truncate(f.Size); err != nil {
+			return err
+		}
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var errs []error
+	chunk := (f.Size + int64(parts) - 1) / int64(parts)
+	for i := 0; i < parts; i++ {
+		if state.Done[i] {
+			continue
+		}
+		start := int64(i) * chunk
+		end := min(start+chunk, f.Size) - 1
+		wg.Add(1)
+		go func(index int, start, end int64) {
+			defer wg.Done()
+			if err := acquire(ctx, slots); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				return
+			}
+			defer release(slots)
+			if err := d.downloadRange(ctx, repo, revision, out, f.Path, start, end); err != nil {
+				mu.Lock()
+				errs = append(errs, err)
+				mu.Unlock()
+				cancel()
+				return
+			}
+			mu.Lock()
+			state.Done[index] = true
+			data, _ := json.Marshal(state)
+			if err := os.WriteFile(meta, data, 0o644); err != nil {
+				errs = append(errs, err)
+				cancel()
+			}
+			mu.Unlock()
+		}(i, start, end)
+	}
+	wg.Wait()
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return out.Sync()
+}
+
+func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64) error {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	timer := time.AfterFunc(d.Timeout, cancel)
+	defer timer.Stop()
+	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo"
+	q := url.Values{"Revision": {revision}, "FilePath": {path}}
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u+"?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	d.headers(req)
+	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
+	resp, err := d.client().Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	wantPrefix := fmt.Sprintf("bytes %d-%d/", start, end)
+	if resp.StatusCode != http.StatusPartialContent || !strings.HasPrefix(resp.Header.Get("Content-Range"), wantPrefix) {
+		return errRangeUnsupported
+	}
+	written, err := io.CopyBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout}, make([]byte, 1<<20))
+	if err != nil {
+		return err
+	}
+	if written != end-start+1 {
+		return fmt.Errorf("分片不完整: 得到 %d 字节，预期 %d", written, end-start+1)
+	}
+	return nil
+}
+
+func acquire(ctx context.Context, slots chan struct{}) error {
+	if slots == nil {
+		return nil
+	}
+	select {
+	case slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+func release(slots chan struct{}) {
+	if slots != nil {
+		<-slots
+	}
 }
 
 func (d *Downloader) validExisting(path string, f repoFile) (bool, error) {
@@ -290,6 +446,7 @@ func (d *Downloader) client() *http.Client {
 	return &http.Client{Transport: &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
 		ResponseHeaderTimeout: d.Timeout,
+		MaxIdleConnsPerHost:   max(2, d.Workers),
 	}}
 }
 

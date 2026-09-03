@@ -45,7 +45,8 @@ func main() {
 	var includes, excludes stringList
 	output := flag.String("o", "", "输出目录（默认取模型名称）")
 	revision := flag.String("revision", "master", "分支、标签或提交")
-	workers := flag.Int("workers", min(8, max(2, runtime.NumCPU())), "并发文件数")
+	workers := flag.Int("workers", min(8, max(2, runtime.NumCPU())), "最大并发下载连接数")
+	parts := flag.Int("parts", 4, "大文件并行分片数（总连接数仍受 workers 限制）")
 	retries := flag.Int("retries", 5, "每个文件的重试次数")
 	timeout := flag.Duration("timeout", 60*time.Second, "连接或连续无数据超时")
 	endpoint := flag.String("endpoint", envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), "ModelScope 服务地址")
@@ -65,8 +66,8 @@ func main() {
 		usage()
 		os.Exit(2)
 	}
-	if *workers < 1 || *retries < 0 || *timeout <= 0 {
-		fatal(errors.New("workers 必须大于 0，retries 不能为负，timeout 必须大于 0"))
+	if *workers < 1 || *parts < 1 || *retries < 0 || *timeout <= 0 {
+		fatal(errors.New("workers 和 parts 必须大于 0，retries 不能为负，timeout 必须大于 0"))
 	}
 
 	repo := flag.Arg(0)
@@ -79,7 +80,7 @@ func main() {
 	defer stop()
 	d := Downloader{
 		Endpoint: strings.TrimRight(*endpoint, "/"), Token: *token,
-		Workers: *workers, Retries: *retries, Timeout: *timeout, Verify: *verify,
+		Workers: *workers, Parts: *parts, Retries: *retries, Timeout: *timeout, Verify: *verify,
 		Out: os.Stderr,
 	}
 	if err := d.Download(ctx, repo, *revision, *output, includes, excludes); err != nil {

@@ -9,7 +9,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -69,6 +71,52 @@ func TestResume(t *testing.T) {
 	got, _ := os.ReadFile(part)
 	if string(got) != string(body) {
 		t.Fatalf("got %q", got)
+	}
+}
+
+func TestParallelRanges(t *testing.T) {
+	body := make([]byte, 16<<20+1)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	var mu sync.Mutex
+	var ranges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := strings.TrimPrefix(r.Header.Get("Range"), "bytes=")
+		bounds := strings.Split(h, "-")
+		if len(bounds) != 2 {
+			http.Error(w, "range required", http.StatusBadRequest)
+			return
+		}
+		start, err1 := strconv.ParseInt(bounds[0], 10, 64)
+		end, err2 := strconv.ParseInt(bounds[1], 10, 64)
+		if err1 != nil || err2 != nil || start < 0 || end >= int64(len(body)) || start > end {
+			http.Error(w, "bad range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[start : end+1])
+	}))
+	defer server.Close()
+
+	part := filepath.Join(t.TempDir(), "model.part")
+	d := Downloader{Endpoint: server.URL, Workers: 3, Parts: 3, Timeout: 5 * time.Second, Client: server.Client()}
+	if err := d.downloadParallel(context.Background(), "a/b", "master", part, repoFile{Path: "model", Size: int64(len(body))}, make(chan struct{}, 3)); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(part)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.EqualFold(fmt.Sprintf("%x", sha256.Sum256(got)), fmt.Sprintf("%x", sha256.Sum256(body))) {
+		t.Fatal("parallel download content mismatch")
+	}
+	if len(ranges) < 2 {
+		t.Fatalf("got %d range request(s), want at least 2", len(ranges))
 	}
 }
 
