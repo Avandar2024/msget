@@ -390,37 +390,48 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 			defer wg.Done()
 			for index := range jobs {
 				partStart := int64(index) * chunk
-				start := partStart + state.Received[index]
 				end := min(partStart+chunk, f.Size) - 1
-				if err := acquire(ctx, slots); err != nil {
+				for attempt := 0; ; attempt++ {
+					start := partStart + state.Received[index]
+					if err := acquire(ctx, slots); err != nil {
+						mu.Lock()
+						errs = append(errs, err)
+						mu.Unlock()
+						return
+					}
+					progress.connection(1)
+					written, downloadErr := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress)
+					progress.connection(-1)
+					release(slots)
 					mu.Lock()
-					errs = append(errs, err)
+					if err := out.Sync(); err != nil {
+						errs = append(errs, err)
+						cancel()
+					} else {
+						state.Received[index] += written
+						state.Done[index] = state.Received[index] == end-partStart+1
+					}
+					if err := writePartState(meta, state); err != nil {
+						errs = append(errs, err)
+						cancel()
+					}
 					mu.Unlock()
-					return
-				}
-				progress.connection(1)
-				written, downloadErr := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress)
-				progress.connection(-1)
-				release(slots)
-				mu.Lock()
-				if err := out.Sync(); err != nil {
-					errs = append(errs, err)
-					cancel()
-				} else {
-					state.Received[index] += written
-					state.Done[index] = state.Received[index] == end-partStart+1
-				}
-				if err := writePartState(meta, state); err != nil {
-					errs = append(errs, err)
-					cancel()
-				}
-				if downloadErr != nil {
-					errs = append(errs, downloadErr)
-					cancel()
-				}
-				mu.Unlock()
-				if downloadErr != nil {
-					return
+					if downloadErr == nil {
+						break
+					}
+					if errors.Is(downloadErr, errRangeUnsupported) || attempt >= d.Retries {
+						mu.Lock()
+						errs = append(errs, downloadErr)
+						mu.Unlock()
+						cancel()
+						return
+					}
+					delay := time.Duration(1<<min(attempt, 5)) * time.Second
+					select {
+					case <-time.After(delay):
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 		}()

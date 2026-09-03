@@ -223,6 +223,57 @@ func TestParallelLayoutUsesDynamicRanges(t *testing.T) {
 	}
 }
 
+func TestParallelRetriesOnlyFailedRange(t *testing.T) {
+	body := make([]byte, 16<<20)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	chunk := int64(len(body)) / 2
+	mid := chunk / 2
+	var mu sync.Mutex
+	requests := make(map[string]int)
+	failed := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHeader := r.Header.Get("Range")
+		bounds := strings.Split(strings.TrimPrefix(rangeHeader, "bytes="), "-")
+		start, _ := strconv.ParseInt(bounds[0], 10, 64)
+		end, _ := strconv.ParseInt(bounds[1], 10, 64)
+		mu.Lock()
+		requests[rangeHeader]++
+		failThis := start == 0 && !failed
+		if failThis {
+			failed = true
+		}
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
+		w.WriteHeader(http.StatusPartialContent)
+		if failThis {
+			_, _ = w.Write(body[start:mid])
+			return
+		}
+		_, _ = w.Write(body[start : end+1])
+	}))
+	defer server.Close()
+
+	part := filepath.Join(t.TempDir(), "model.part")
+	d := Downloader{Endpoint: server.URL, Workers: 2, Parts: 2, Retries: 1, Timeout: 5 * time.Second, Client: server.Client()}
+	progress := newDownloadProgress(io.Discard, int64(len(body)), 1)
+	if err := d.downloadParallel(context.Background(), "a/b", "master", part, repoFile{Path: "model", Size: int64(len(body))}, make(chan struct{}, 2), progress.file(int64(len(body))), progress); err != nil {
+		t.Fatal(err)
+	}
+	if requests[fmt.Sprintf("bytes=%d-%d", chunk, int64(len(body))-1)] != 1 {
+		t.Fatalf("successful range was retried: %v", requests)
+	}
+	if requests[fmt.Sprintf("bytes=%d-%d", mid, chunk-1)] != 1 {
+		t.Fatalf("failed range did not resume independently: %v", requests)
+	}
+	got, _ := os.ReadFile(part)
+	if !slices.Equal(got, body) {
+		t.Fatal("retried download content mismatch")
+	}
+}
+
 func TestParallelResumeSkipsCompletedParts(t *testing.T) {
 	body := make([]byte, 16<<20+1)
 	for i := range body {
