@@ -324,7 +324,15 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 
 var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
-const dynamicRangeSize int64 = 64 << 20
+const (
+	dynamicRangeSize   int64 = 64 << 20
+	checkpointBytes    int64 = 256 << 20
+	checkpointInterval       = 2 * time.Second
+)
+
+func checkpointDue(dirty int64, elapsed time.Duration) bool {
+	return dirty >= checkpointBytes || dirty > 0 && elapsed >= checkpointInterval
+}
 
 func parallelLayout(size int64, maxConnections int, rangeSize int64) (connections, ranges int) {
 	connections = min(maxConnections, int((size+(8<<20)-1)/(8<<20)))
@@ -366,6 +374,22 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	var errs []error
+	var dirtyBytes int64
+	lastCheckpoint := time.Now()
+	checkpoint := func(force bool) error {
+		if dirtyBytes == 0 || !force && !checkpointDue(dirtyBytes, time.Since(lastCheckpoint)) {
+			return nil
+		}
+		if err := out.Sync(); err != nil {
+			return err
+		}
+		if err := writePartState(meta, state); err != nil {
+			return err
+		}
+		dirtyBytes = 0
+		lastCheckpoint = time.Now()
+		return nil
+	}
 	chunk := (f.Size + int64(ranges) - 1) / int64(ranges)
 	var completed int64
 	for i := range state.Done {
@@ -404,14 +428,10 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 					progress.connection(-1)
 					release(slots)
 					mu.Lock()
-					if err := out.Sync(); err != nil {
-						errs = append(errs, err)
-						cancel()
-					} else {
-						state.Received[index] += written
-						state.Done[index] = state.Received[index] == end-partStart+1
-					}
-					if err := writePartState(meta, state); err != nil {
+					state.Received[index] += written
+					state.Done[index] = state.Received[index] == end-partStart+1
+					dirtyBytes += written
+					if err := checkpoint(false); err != nil {
 						errs = append(errs, err)
 						cancel()
 					}
@@ -436,24 +456,30 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 			}
 		}()
 	}
+	feedCanceled := false
+feed:
 	for _, i := range pending {
 		select {
 		case jobs <- i:
 		case <-ctx.Done():
-			close(jobs)
-			wg.Wait()
-			if len(errs) > 0 {
-				return errors.Join(errs...)
-			}
-			return ctx.Err()
+			feedCanceled = true
+			break feed
 		}
 	}
 	close(jobs)
 	wg.Wait()
+	mu.Lock()
+	if err := checkpoint(true); err != nil {
+		errs = append(errs, err)
+	}
+	mu.Unlock()
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-	return out.Sync()
+	if feedCanceled {
+		return ctx.Err()
+	}
+	return nil
 }
 
 func responseValidator(resp *http.Response) string {

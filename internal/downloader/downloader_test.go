@@ -223,6 +223,16 @@ func TestParallelLayoutUsesDynamicRanges(t *testing.T) {
 	}
 }
 
+func TestCheckpointDue(t *testing.T) {
+	t.Parallel()
+	if checkpointDue(checkpointBytes-1, checkpointInterval-time.Nanosecond) {
+		t.Fatal("small recent write should not checkpoint")
+	}
+	if !checkpointDue(checkpointBytes, 0) || !checkpointDue(1, checkpointInterval) {
+		t.Fatal("byte and time thresholds should checkpoint")
+	}
+}
+
 func TestParallelRetriesOnlyFailedRange(t *testing.T) {
 	body := make([]byte, 16<<20)
 	for i := range body {
