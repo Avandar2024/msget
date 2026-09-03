@@ -76,19 +76,19 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 			continue
 		}
 		if _, err := safeTarget(root, f.Path); err != nil {
-			return fmt.Errorf("服务端返回了不安全路径 %q: %w", f.Path, err)
+			return fmt.Errorf("server returned unsafe path %q: %w", f.Path, err)
 		}
 		selected = append(selected, f)
 		total += f.Size
 	}
 	sort.Slice(selected, func(i, j int) bool { return selected[i].Path < selected[j].Path })
 	if len(selected) == 0 {
-		return errors.New("没有匹配的模型文件")
+		return errors.New("no model files matched")
 	}
 	if err := os.MkdirAll(root, 0o755); err != nil {
 		return err
 	}
-	fmt.Fprintf(d.writer(), "模型 %s@%s：%d 个文件，%s -> %s\n", repo, revision, len(selected), humanBytes(total), root)
+	fmt.Fprintf(d.writer(), "Model %s@%s: %d files, %s -> %s\n", repo, revision, len(selected), humanBytes(total), root)
 	progress := newDownloadProgress(d.writer(), total, len(selected))
 	defer progress.finish()
 
@@ -102,16 +102,20 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		go func() {
 			defer wg.Done()
 			for f := range jobs {
+				progress.fileActive(f.Path, true)
 				if err := d.downloadFile(ctx, repo, revision, root, f, slots, progress); err != nil {
-					mu.Lock()
-					failures = append(failures, fmt.Errorf("%s: %w", f.Path, err))
-					progress.log("失败  %s: %v\n", f.Path, err)
-					mu.Unlock()
+					if ctx.Err() == nil {
+						mu.Lock()
+						failures = append(failures, fmt.Errorf("%s: %w", f.Path, err))
+						progress.log("Failed  %s: %v\n", f.Path, err)
+						mu.Unlock()
+					}
 				} else {
 					mu.Lock()
-					progress.log("完成  %s (%s)\n", f.Path, humanBytes(f.Size))
+					progress.logDone("Done  %s (%s)\n", f.Path, humanBytes(f.Size))
 					mu.Unlock()
 				}
+				progress.fileActive(f.Path, false)
 			}
 		}()
 	}
@@ -126,11 +130,14 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 	}
 	close(jobs)
 	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if len(failures) > 0 {
-		return fmt.Errorf("%d 个文件下载失败（可重新运行以断点续传）: %w", len(failures), errors.Join(failures...))
+		return fmt.Errorf("%d file(s) failed (run again to resume): %w", len(failures), errors.Join(failures...))
 	}
 	progress.finish()
-	fmt.Fprintf(d.writer(), "下载完成：%s\n", root)
+	fmt.Fprintf(d.writer(), "Download complete: %s\n", root)
 	return nil
 }
 
@@ -144,15 +151,15 @@ func (d *Downloader) list(ctx context.Context, repo, revision string) ([]repoFil
 	d.headers(req)
 	resp, err := d.client().Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("获取文件列表: %w", err)
+		return nil, fmt.Errorf("list files: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, responseError("获取文件列表", resp)
+		return nil, responseError("list files", resp)
 	}
 	var result listResponse
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&result); err != nil {
-		return nil, fmt.Errorf("解析文件列表: %w", err)
+		return nil, fmt.Errorf("decode file list: %w", err)
 	}
 	if result.Code != 0 && result.Code != 200 || result.Message != "" && !result.Success && result.Code != 200 {
 		return nil, fmt.Errorf("ModelScope API: code=%d, %s", result.Code, result.Message)
@@ -249,7 +256,7 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	}
 	fileProgress.set(offset)
 	if err := writePartState(meta, state); err != nil {
-		return fmt.Errorf("保存续传状态: %w", err)
+		return fmt.Errorf("save resume state: %w", err)
 	}
 	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo"
 	q := url.Values{"Revision": {revision}, "FilePath": {f.Path}}
@@ -277,16 +284,16 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 		return nil
 	}
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return responseError("下载", resp)
+		return responseError("download", resp)
 	}
 	appendMode := offset > 0 && resp.StatusCode == http.StatusPartialContent && validContentRange(resp.Header.Get("Content-Range"), offset, f.Size)
 	if offset > 0 && resp.StatusCode == http.StatusPartialContent && !appendMode {
-		return fmt.Errorf("服务端返回了不匹配的 Content-Range: %q", resp.Header.Get("Content-Range"))
+		return fmt.Errorf("server returned mismatched Content-Range: %q", resp.Header.Get("Content-Range"))
 	}
 	if validator := responseValidator(resp); validator != "" && validator != state.Validator {
 		state.Validator = validator
 		if err := writePartState(meta, state); err != nil {
-			return fmt.Errorf("保存续传状态: %w", err)
+			return fmt.Errorf("save resume state: %w", err)
 		}
 	}
 	if !appendMode {
@@ -316,22 +323,23 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	return closeErr
 }
 
-var errRangeUnsupported = errors.New("服务器不支持分片下载")
+var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
 type partState struct {
-	Version   int    `json:"version"`
-	Repo      string `json:"repo"`
-	Revision  string `json:"revision"`
-	Path      string `json:"path"`
-	SHA256    string `json:"sha256,omitempty"`
-	Size      int64  `json:"size"`
-	Parts     int    `json:"parts"`
-	Validator string `json:"validator,omitempty"`
-	Done      []bool `json:"done,omitempty"`
+	Version   int     `json:"version"`
+	Repo      string  `json:"repo"`
+	Revision  string  `json:"revision"`
+	Path      string  `json:"path"`
+	SHA256    string  `json:"sha256,omitempty"`
+	Size      int64   `json:"size"`
+	Parts     int     `json:"parts"`
+	Validator string  `json:"validator,omitempty"`
+	Done      []bool  `json:"done,omitempty"`
+	Received  []int64 `json:"received,omitempty"`
 }
 
 func newPartState(repo, revision string, f repoFile, parts int) partState {
-	return partState{Version: 1, Repo: repo, Revision: revision, Path: f.Path, SHA256: f.SHA256, Size: f.Size, Parts: parts, Done: make([]bool, parts)}
+	return partState{Version: 1, Repo: repo, Revision: revision, Path: f.Path, SHA256: f.SHA256, Size: f.Size, Parts: parts, Done: make([]bool, parts), Received: make([]int64, parts)}
 }
 
 func loadMatchingPartState(path string, expected partState, dst *partState) bool {
@@ -342,6 +350,9 @@ func loadMatchingPartState(path string, expected partState, dst *partState) bool
 	var saved partState
 	if json.Unmarshal(data, &saved) != nil || saved.Version != expected.Version || saved.Repo != expected.Repo || saved.Revision != expected.Revision || saved.Path != expected.Path || saved.SHA256 != expected.SHA256 || saved.Size != expected.Size || saved.Parts != expected.Parts || len(saved.Done) != expected.Parts {
 		return false
+	}
+	if len(saved.Received) != expected.Parts {
+		saved.Received = make([]int64, expected.Parts)
 	}
 	if dst != nil {
 		*dst = saved
@@ -395,11 +406,12 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	defer out.Close()
 	if st, err := out.Stat(); err != nil || st.Size() != f.Size || !matched {
 		state.Done = make([]bool, parts)
+		state.Received = make([]int64, parts)
 		if err := out.Truncate(f.Size); err != nil {
 			return err
 		}
 		if err := writePartState(meta, state); err != nil {
-			return fmt.Errorf("保存续传状态: %w", err)
+			return fmt.Errorf("save resume state: %w", err)
 		}
 	}
 	ctx, cancel := context.WithCancel(ctx)
@@ -409,18 +421,22 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	var errs []error
 	chunk := (f.Size + int64(parts) - 1) / int64(parts)
 	var completed int64
-	for i, done := range state.Done {
-		if done {
-			completed += min(chunk, f.Size-int64(i)*chunk)
+	for i := range state.Done {
+		partSize := min(chunk, f.Size-int64(i)*chunk)
+		if state.Done[i] {
+			state.Received[i] = partSize
 		}
+		state.Received[i] = max(int64(0), min(state.Received[i], partSize))
+		completed += state.Received[i]
 	}
 	fileProgress.set(completed)
 	for i := 0; i < parts; i++ {
 		if state.Done[i] {
 			continue
 		}
-		start := int64(i) * chunk
-		end := min(start+chunk, f.Size) - 1
+		partStart := int64(i) * chunk
+		start := partStart + state.Received[i]
+		end := min(partStart+chunk, f.Size) - 1
 		wg.Add(1)
 		go func(index int, start, end int64) {
 			defer wg.Done()
@@ -433,25 +449,22 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 			defer release(slots)
 			progress.connection(1)
 			defer progress.connection(-1)
-			if err := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress); err != nil {
-				mu.Lock()
-				errs = append(errs, err)
-				mu.Unlock()
-				cancel()
-				return
-			}
+			written, downloadErr := d.downloadRange(ctx, repo, revision, out, f.Path, start, end, fileProgress)
 			mu.Lock()
 			if err := out.Sync(); err != nil {
 				errs = append(errs, err)
 				cancel()
 			} else {
-				state.Done[index] = true
+				state.Received[index] += written
+				state.Done[index] = state.Received[index] == end-(int64(index)*chunk)+1
 			}
-			if len(errs) == 0 {
-				if err := writePartState(meta, state); err != nil {
-					errs = append(errs, err)
-					cancel()
-				}
+			if err := writePartState(meta, state); err != nil {
+				errs = append(errs, err)
+				cancel()
+			}
+			if downloadErr != nil {
+				errs = append(errs, downloadErr)
+				cancel()
 			}
 			mu.Unlock()
 		}(i, start, end)
@@ -478,7 +491,7 @@ func validContentRange(value string, offset, size int64) bool {
 	return start == offset && end >= start && (size <= 0 || total == size)
 }
 
-func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64, fileProgress *fileProgress) error {
+func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, out *os.File, path string, start, end int64, fileProgress *fileProgress) (int64, error) {
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := time.AfterFunc(d.Timeout, cancel)
@@ -487,27 +500,27 @@ func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, o
 	q := url.Values{"Revision": {revision}, "FilePath": {path}}
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u+"?"+q.Encode(), nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	d.headers(req)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, end))
 	resp, err := d.client().Do(req)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	wantPrefix := fmt.Sprintf("bytes %d-%d/", start, end)
 	if resp.StatusCode != http.StatusPartialContent || !strings.HasPrefix(resp.Header.Get("Content-Range"), wantPrefix) {
-		return errRangeUnsupported
+		return 0, errRangeUnsupported
 	}
 	written, err := io.CopyBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout, onRead: fileProgress.read}, make([]byte, 1<<20))
 	if err != nil {
-		return err
+		return written, err
 	}
 	if written != end-start+1 {
-		return fmt.Errorf("分片不完整: 得到 %d 字节，预期 %d", written, end-start+1)
+		return written, fmt.Errorf("incomplete range: got %d bytes, expected %d", written, end-start+1)
 	}
-	return nil
+	return written, nil
 }
 
 func acquire(ctx context.Context, slots chan struct{}) error {
@@ -547,7 +560,7 @@ func verifyFile(path string, f repoFile, verify bool) error {
 		return err
 	}
 	if f.Size > 0 && st.Size() != f.Size {
-		return fmt.Errorf("文件不完整: 得到 %d 字节，预期 %d", st.Size(), f.Size)
+		return fmt.Errorf("incomplete file: got %d bytes, expected %d", st.Size(), f.Size)
 	}
 	if verify && f.SHA256 != "" {
 		ok, err := hashMatches(path, f.SHA256)
@@ -555,7 +568,7 @@ func verifyFile(path string, f repoFile, verify bool) error {
 			return err
 		}
 		if !ok {
-			return errors.New("SHA-256 校验失败")
+			return errors.New("SHA-256 verification failed")
 		}
 	}
 	return nil
@@ -644,11 +657,11 @@ func responseError(action string, resp *http.Response) error {
 func validateRepo(repo string) error {
 	parts := strings.Split(repo, "/")
 	if len(parts) < 2 {
-		return errors.New("模型 ID 应为 namespace/model，例如 Qwen/Qwen3-0.6B")
+		return errors.New("model ID must be namespace/model, for example Qwen/Qwen3-0.6B")
 	}
 	for _, p := range parts {
 		if p == "" || p == "." || p == ".." {
-			return errors.New("模型 ID 非法")
+			return errors.New("invalid model ID")
 		}
 	}
 	return nil
@@ -664,12 +677,12 @@ func safeTarget(root, remote string) (string, error) {
 	remote = strings.ReplaceAll(remote, "\\", "/")
 	clean := filepath.Clean(filepath.FromSlash(remote))
 	if filepath.IsAbs(clean) || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
-		return "", errors.New("路径越界")
+		return "", errors.New("path escapes output directory")
 	}
 	target := filepath.Join(root, clean)
 	rel, err := filepath.Rel(root, target)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return "", errors.New("路径越界")
+		return "", errors.New("path escapes output directory")
 	}
 	return target, nil
 }

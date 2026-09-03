@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -25,28 +26,28 @@ func (s *stringList) Set(v string) error {
 }
 
 func usage() {
-	fmt.Fprintf(flag.CommandLine.Output(), `msget - ModelScope 模型下载器
+	fmt.Fprintf(flag.CommandLine.Output(), `msget - ModelScope model downloader
 
-用法:
-  msget [选项] <namespace/model>
+Usage:
+  msget [options] <namespace/model>
 
-示例:
+Examples:
   msget Qwen/Qwen3-0.6B
   msget -o ./model -include '*.json' Qwen/Qwen3-0.6B
   MODELSCOPE_API_TOKEN=ms-xxx msget owner/private-model
 
-选项:
+Options:
 `)
 	flag.PrintDefaults()
 }
 
 func main() {
 	var includes, excludes stringList
-	output := flag.String("o", "", "输出目录（默认取模型名称）")
-	revision := flag.String("revision", "master", "分支、标签或提交")
-	showVersion := flag.Bool("version", false, "显示版本")
-	flag.Var(&includes, "include", "只下载匹配 glob 的文件，可重复")
-	flag.Var(&excludes, "exclude", "排除匹配 glob 的文件，可重复")
+	output := flag.String("o", "", "output directory (default: model name)")
+	revision := flag.String("revision", "master", "branch, tag, or commit")
+	showVersion := flag.Bool("version", false, "show version")
+	flag.Var(&includes, "include", "download only files matching this glob (repeatable)")
+	flag.Var(&excludes, "exclude", "exclude files matching this glob (repeatable)")
 	flag.Usage = usage
 	flag.Parse()
 
@@ -79,6 +80,10 @@ func main() {
 		Out:             os.Stderr,
 	}
 	if err := d.Download(ctx, repo, *revision, *output, includes, excludes); err != nil {
+		if errors.Is(err, context.Canceled) {
+			fmt.Fprintln(os.Stderr, "Download paused. Run the same command to resume.")
+			os.Exit(130)
+		}
 		fatal(err)
 	}
 }
@@ -91,6 +96,6 @@ func envOr(key, fallback string) string {
 }
 
 func fatal(err error) {
-	fmt.Fprintln(os.Stderr, "错误:", err)
+	fmt.Fprintln(os.Stderr, "Error:", err)
 	os.Exit(1)
 }

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -212,6 +213,62 @@ func TestParallelResumeSkipsCompletedParts(t *testing.T) {
 	got, _ := os.ReadFile(part)
 	if fmt.Sprintf("%x", sha256.Sum256(got)) != fmt.Sprintf("%x", sha256.Sum256(body)) {
 		t.Fatal("resumed download content mismatch")
+	}
+}
+
+func TestParallelResumeContinuesPartialParts(t *testing.T) {
+	body := make([]byte, 16<<20+1)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	var mu sync.Mutex
+	var ranges []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		bounds := strings.Split(strings.TrimPrefix(r.Header.Get("Range"), "bytes="), "-")
+		start, _ := strconv.ParseInt(bounds[0], 10, 64)
+		end, _ := strconv.ParseInt(bounds[1], 10, 64)
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body[start : end+1])
+	}))
+	defer server.Close()
+
+	part := filepath.Join(t.TempDir(), "model.part")
+	parts := 3
+	chunk := (int64(len(body)) + int64(parts) - 1) / int64(parts)
+	received := int64(12345)
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(int64(len(body))); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(body[:received], 0); err != nil {
+		t.Fatal(err)
+	}
+	_ = f.Close()
+	file := repoFile{Path: "model", Size: int64(len(body)), SHA256: "identity"}
+	state := newPartState("a/b", "master", file, parts)
+	state.Received[0] = received
+	if err := writePartState(part+".meta", state); err != nil {
+		t.Fatal(err)
+	}
+	d := Downloader{Endpoint: server.URL, Workers: parts, Parts: parts, Timeout: 5 * time.Second, Client: server.Client()}
+	progress := newDownloadProgress(io.Discard, int64(len(body)), 1)
+	if err := d.downloadParallel(context.Background(), "a/b", "master", part, file, make(chan struct{}, parts), progress.file(int64(len(body))), progress); err != nil {
+		t.Fatal(err)
+	}
+	wantRange := fmt.Sprintf("bytes=%d-%d", received, chunk-1)
+	if !slices.Contains(ranges, wantRange) {
+		t.Fatalf("ranges %q do not continue partial range at %q", ranges, wantRange)
+	}
+	got, _ := os.ReadFile(part)
+	if fmt.Sprintf("%x", sha256.Sum256(got)) != fmt.Sprintf("%x", sha256.Sum256(body)) {
+		t.Fatal("partial-range resumed content mismatch")
 	}
 }
 

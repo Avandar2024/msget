@@ -5,6 +5,9 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +22,7 @@ type downloadProgress struct {
 	files       int
 	doneFiles   int
 	connections int
+	active      map[string]struct{}
 	started     time.Time
 	terminal    bool
 	stop        chan struct{}
@@ -35,7 +39,7 @@ type fileProgress struct {
 }
 
 func newDownloadProgress(out io.Writer, total int64, files int) *downloadProgress {
-	p := &downloadProgress{out: out, total: total, files: files, started: time.Now(), stop: make(chan struct{}), done: make(chan struct{})}
+	p := &downloadProgress{out: out, total: total, files: files, active: make(map[string]struct{}), started: time.Now(), stop: make(chan struct{}), done: make(chan struct{})}
 	if f, ok := out.(*os.File); ok {
 		if st, err := f.Stat(); err == nil {
 			p.terminal = st.Mode()&os.ModeCharDevice != 0
@@ -111,6 +115,16 @@ func (p *downloadProgress) connection(delta int) {
 	p.mu.Unlock()
 }
 
+func (p *downloadProgress) fileActive(name string, active bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if active {
+		p.active[name] = struct{}{}
+	} else {
+		delete(p.active, name)
+	}
+}
+
 func (p *downloadProgress) finish() {
 	p.finishOnce.Do(func() {
 		if p.terminal {
@@ -129,6 +143,14 @@ func (p *downloadProgress) log(format string, args ...any) {
 	fmt.Fprintf(p.out, format, args...)
 }
 
+func (p *downloadProgress) logDone(format string, args ...any) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !p.terminal {
+		fmt.Fprintf(p.out, format, args...)
+	}
+}
+
 func (p *downloadProgress) render(final bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -142,28 +164,56 @@ func (p *downloadProgress) render(final bool) {
 		percent = float64(p.current) / float64(p.total)
 	}
 	percent = math.Max(0, math.Min(1, percent))
-	const width = 28
+	const width = 12
 	filled := int(percent * width)
-	bar := strings.Repeat("━", filled) + strings.Repeat("─", width-filled)
+	bar := strings.Repeat("#", filled) + strings.Repeat("-", width-filled)
 	eta := "--:--"
 	if speed > 0 && p.current < p.total {
 		eta = formatDuration(time.Duration(float64(p.total-p.current)/speed) * time.Second)
 	} else if p.current >= p.total {
 		eta = "00:00"
 	}
-	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}[p.frame%10]
+	spinner := []string{"|", "/", "-", "\\"}[p.frame%4]
 	p.frame++
 	if final {
 		if p.current >= p.total && p.doneFiles == p.files {
-			spinner = "✓"
+			spinner = "OK"
 		} else {
 			spinner = "!"
 		}
 	}
-	fmt.Fprintf(p.out, "\r\x1b[2K\x1b[36m%s\x1b[0m \x1b[32m%s\x1b[0m %6.2f%%  %s/%s  %s/s  ETA %s  文件 %d/%d  连接 %d", spinner, bar, percent*100, humanBytes(p.current), humanBytes(p.total), humanBytes(int64(speed)), eta, p.doneFiles, p.files, p.connections)
+	active := make([]string, 0, len(p.active))
+	for name := range p.active {
+		active = append(active, filepath.Base(name))
+	}
+	sort.Strings(active)
+	line := fmt.Sprintf("%s [%s] %5.1f%% %s/%s %s/s ETA %s %d/%d C%d", spinner, bar, percent*100, humanBytes(p.current), humanBytes(p.total), humanBytes(int64(speed)), eta, p.doneFiles, p.files, p.connections)
+	if len(active) > 0 {
+		line += " | " + strings.Join(active, ",")
+	}
+	line = truncateLine(line, terminalWidth())
+	fmt.Fprintf(p.out, "\r\x1b[2K%s", line)
 	if final {
 		fmt.Fprintln(p.out)
 	}
+}
+
+func terminalWidth() int {
+	if width, err := strconv.Atoi(os.Getenv("COLUMNS")); err == nil && width >= 40 {
+		return width - 1
+	}
+	return 79
+}
+
+func truncateLine(line string, width int) string {
+	runes := []rune(line)
+	if len(runes) <= width {
+		return line
+	}
+	if width <= 3 {
+		return string(runes[:width])
+	}
+	return string(runes[:width-3]) + "..."
 }
 
 func formatDuration(d time.Duration) string {
