@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -68,19 +68,25 @@ func (d *Downloader) client() *http.Client {
 }
 
 // dualTransport keeps separate IPv4 and IPv6 connection pools. Requests are
-// alternated between them, with a connection-error fallback for hosts that are
-// not reachable over one of the address families.
+// weighted by each family's measured response throughput, with occasional
+// probes and connection-error fallback for incomplete dual-stack hosts.
 type dualTransport struct {
 	transports [2]http.RoundTripper
-	next       atomic.Uint64
+	mu         sync.Mutex
+	next       uint64
+	rate       [2]float64
+	samples    [2]uint64
+	failures   [2]uint64
 }
 
 func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	first := int((t.next.Add(1) - 1) % 2)
+	first := t.choose()
 	resp, err := t.transports[first].RoundTrip(req)
 	if err == nil {
+		resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: first, owner: t}
 		return resp, nil
 	}
+	t.recordFailure(first)
 	if req.Body != nil && req.GetBody == nil {
 		return nil, err
 	}
@@ -90,9 +96,100 @@ func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	resp, retryErr := t.transports[1-first].RoundTrip(retry)
 	if retryErr != nil {
+		t.recordFailure(1 - first)
 		return nil, errors.Join(err, retryErr)
 	}
+	resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: 1 - first, owner: t}
 	return resp, nil
+}
+
+func (t *dualTransport) choose() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ticket := t.next
+	t.next++
+	if t.samples[0] == 0 && t.samples[1] == 0 {
+		return int(ticket % 2)
+	}
+	// Give an unmeasured family occasional probes, while preferring the
+	// measured family for the other requests.
+	if t.samples[0] == 0 {
+		if ticket%8 == 0 {
+			return 0
+		}
+		return 1
+	}
+	if t.samples[1] == 0 {
+		if ticket%8 == 0 {
+			return 1
+		}
+		return 0
+	}
+	if t.failures[0] >= 3 && ticket%16 != 0 {
+		return 1
+	}
+	if t.failures[1] >= 3 && ticket%16 != 0 {
+		return 0
+	}
+	// A deterministic weighted choice avoids adding a random source to the
+	// downloader. Rates are EWMA values in bytes/sec.
+	weight := int(t.rate[0] * 1000 / (t.rate[0] + t.rate[1]))
+	if weight < 1 {
+		weight = 1
+	}
+	if weight > 999 {
+		weight = 999
+	}
+	if int(ticket%1000) < weight {
+		return 0
+	}
+	return 1
+}
+
+func (t *dualTransport) recordFailure(family int) {
+	t.mu.Lock()
+	t.failures[family]++
+	t.mu.Unlock()
+}
+
+func (t *dualTransport) recordRate(family int, bytes int64, elapsed time.Duration) {
+	if bytes <= 0 || elapsed <= 0 {
+		return
+	}
+	rate := float64(bytes) / elapsed.Seconds()
+	t.mu.Lock()
+	if t.samples[family] == 0 {
+		t.rate[family] = rate
+	} else {
+		t.rate[family] = t.rate[family]*0.7 + rate*0.3
+	}
+	t.samples[family]++
+	t.failures[family] = 0
+	t.mu.Unlock()
+}
+
+type measuredBody struct {
+	io.ReadCloser
+	started time.Time
+	family  int
+	owner   *dualTransport
+	bytes   int64
+	once    sync.Once
+}
+
+func (b *measuredBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.bytes += int64(n)
+	if err == io.EOF {
+		b.Close()
+	}
+	return n, err
+}
+
+func (b *measuredBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(func() { b.owner.recordRate(b.family, b.bytes, time.Since(b.started)) })
+	return err
 }
 
 func (t *dualTransport) CloseIdleConnections() {

@@ -68,13 +68,15 @@ The HTTP pool reuses connections while limiting total and per-host concurrency. 
 
 On hosts with genuinely different IPv4 and IPv6 routes, the
 `-network dual` mode maintains a separate connection pool for each family and
-alternates concurrent requests between them:
+assigns requests according to their measured recent throughput:
 
 ```bash
 ./msget -network dual Qwen/Qwen3-0.6B
 ```
 
-If one address family cannot connect, that request falls back to the other.
+The first requests probe both families; subsequent requests use an EWMA of
+bytes per second to favor the faster route. If one address family cannot
+connect, that request falls back to the other.
 Use `-network ipv4` or `-network ipv6` to force one family. The default is
 `-network dual`; pass `-network auto` to use Go's normal Happy Eyeballs
 selection. Dual mode improves throughput only when the two routes have

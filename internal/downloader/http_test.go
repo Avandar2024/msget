@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 )
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
@@ -157,6 +158,23 @@ func TestDualTransportFallsBack(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+func TestDualTransportUsesMeasuredRate(t *testing.T) {
+	t.Parallel()
+	transport := &dualTransport{}
+	transport.recordRate(0, 10, time.Second)
+	transport.recordRate(1, 100, time.Second)
+	transport.mu.Lock()
+	transport.next = 1 // avoid the first weighted ticket being a probe artifact
+	transport.mu.Unlock()
+	counts := [2]int{}
+	for range 1000 {
+		counts[transport.choose()]++
+	}
+	if counts[1] <= counts[0] {
+		t.Fatalf("weighted choices = v4:%d v6:%d", counts[0], counts[1])
 	}
 }
 
