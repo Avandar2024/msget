@@ -17,8 +17,11 @@ import (
 )
 
 type Downloader struct {
+	Source          string
 	Endpoint        string
 	Token           string
+	HFEndpoint      string
+	HFToken         string
 	UserAgent       string
 	Workers         int
 	Parts           int
@@ -57,6 +60,18 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		defer copy.Client.CloseIdleConnections()
 	}
 	d = &copy
+	switch d.Source {
+	case "", SourceAuto, SourceModelScope, SourceHF:
+	default:
+		return fmt.Errorf("unknown model source %q", d.Source)
+	}
+	requestedRevision := revision
+	if revision == "" {
+		revision = "master"
+		if d.Source == SourceHF {
+			revision = "main"
+		}
+	}
 	if err := validateRepo(repo); err != nil {
 		return err
 	}
@@ -65,6 +80,17 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 		return err
 	}
 	files, err := d.list(ctx, repo, revision)
+	if err != nil && d.Source == SourceAuto && isHTTPStatus(err, http.StatusNotFound) {
+		d.Source = SourceHF
+		d.Endpoint = strings.TrimRight(d.HFEndpoint, "/")
+		d.Token = d.HFToken
+		revision = requestedRevision
+		if revision == "" {
+			revision = "main"
+		}
+		fmt.Fprintf(d.writer(), "Model %s not found on ModelScope; trying Hugging Face mirror\n", repo)
+		files, err = d.list(ctx, repo, revision)
+	}
 	if err != nil {
 		return err
 	}
@@ -141,6 +167,9 @@ func (d *Downloader) Download(ctx context.Context, repo, revision, output string
 }
 
 func (d *Downloader) list(ctx context.Context, repo, revision string) ([]repoFile, error) {
+	if d.Source == SourceHF {
+		return d.listHF(ctx, repo, revision)
+	}
 	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo/files"
 	q := url.Values{"Revision": {revision}, "Recursive": {"true"}}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u+"?"+q.Encode(), nil)
@@ -241,7 +270,7 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	if st, err := os.Stat(part); err == nil {
 		offset = st.Size()
 	}
-	state := newPartState(repo, revision, f, 1)
+	state := newPartState(d.resumeRepo(repo), revision, f, 1)
 	meta := part + ".meta"
 	if offset > 0 {
 		if !loadMatchingPartState(meta, state, &state) {
@@ -257,13 +286,12 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 	if err := writePartState(meta, state); err != nil {
 		return fmt.Errorf("save resume state: %w", err)
 	}
-	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo"
-	q := url.Values{"Revision": {revision}, "FilePath": {f.Path}}
+	u := d.fileURL(repo, revision, f.Path)
 	attemptCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	timer := time.AfterFunc(d.Timeout, cancel)
 	defer timer.Stop()
-	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u+"?"+q.Encode(), nil)
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return err
 	}
@@ -351,7 +379,7 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 	if connections < 2 {
 		return d.downloadAttemptWithSlots(ctx, repo, revision, part, f, slots, fileProgress, progress)
 	}
-	state := newPartState(repo, revision, f, ranges)
+	state := newPartState(d.resumeRepo(repo), revision, f, ranges)
 	meta := part + ".meta"
 	matched := loadMatchingPartState(meta, state, &state)
 	out, err := os.OpenFile(part, os.O_CREATE|os.O_RDWR, 0o644)
@@ -502,9 +530,8 @@ func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, o
 	defer cancel()
 	timer := time.AfterFunc(d.Timeout, cancel)
 	defer timer.Stop()
-	u := d.Endpoint + "/api/v1/models/" + escapeRepo(repo) + "/repo"
-	q := url.Values{"Revision": {revision}, "FilePath": {path}}
-	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u+"?"+q.Encode(), nil)
+	u := d.fileURL(repo, revision, path)
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, u, nil)
 	if err != nil {
 		return 0, err
 	}

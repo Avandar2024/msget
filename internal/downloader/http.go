@@ -275,7 +275,9 @@ func (d *Downloader) headers(req *http.Request) {
 	req.Header.Set("User-Agent", userAgent)
 	if d.Token != "" {
 		req.Header.Set("Authorization", "Bearer "+d.Token)
-		req.Header.Set("X-ModelScope-Token", d.Token)
+		if d.Source != SourceHF {
+			req.Header.Set("X-ModelScope-Token", d.Token)
+		}
 	}
 }
 
@@ -285,7 +287,22 @@ func responseError(action string, resp *http.Response) error {
 	if message == "" {
 		message = resp.Status
 	}
-	return fmt.Errorf("%s: HTTP %d: %s", action, resp.StatusCode, message)
+	return &httpStatusError{Action: action, StatusCode: resp.StatusCode, Message: message}
+}
+
+type httpStatusError struct {
+	Action     string
+	StatusCode int
+	Message    string
+}
+
+func (e *httpStatusError) Error() string {
+	return fmt.Sprintf("%s: HTTP %d: %s", e.Action, e.StatusCode, e.Message)
+}
+
+func isHTTPStatus(err error, status int) bool {
+	var target *httpStatusError
+	return errors.As(err, &target) && target.StatusCode == status
 }
 
 func validateRepo(repo string) error {

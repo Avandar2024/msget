@@ -28,13 +28,14 @@ func (s *stringList) Set(v string) error {
 }
 
 func usage() {
-	fmt.Fprintf(flag.CommandLine.Output(), `msget - ModelScope model downloader
+	fmt.Fprintf(flag.CommandLine.Output(), `msget - ModelScope and Hugging Face mirror model downloader
 
 Usage:
   msget [options] <namespace/model>
 
 Examples:
   msget Qwen/Qwen3-0.6B
+  msget -source hf Qwen/Qwen3-0.6B
   msget -o ./model -include '*.json' Qwen/Qwen3-0.6B
   MODELSCOPE_API_TOKEN=ms-xxx msget owner/private-model
 
@@ -46,7 +47,8 @@ Options:
 func main() {
 	var includes, excludes stringList
 	output := flag.String("o", "", "output directory (default: model name)")
-	revision := flag.String("revision", "master", "branch, tag, or commit")
+	source := flag.String("source", downloader.SourceAuto, "model source: auto, modelscope, or hf (Hugging Face mirror)")
+	revision := flag.String("revision", "", "branch, tag, or commit (default: master for ModelScope, main for hf)")
 	network := flag.String("network", downloader.NetworkDual, "connection family: auto, ipv4, ipv6, or dual")
 
 	showVersion := flag.Bool("version", false, "show version")
@@ -74,12 +76,25 @@ func main() {
 		*output = parts[len(parts)-1]
 	}
 
+	endpoint, token := envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), os.Getenv("MODELSCOPE_API_TOKEN")
+	hfEndpoint, hfToken := envOr("HF_ENDPOINT", "https://hf-mirror.com"), os.Getenv("HF_TOKEN")
+	switch *source {
+	case downloader.SourceAuto, downloader.SourceModelScope:
+	case downloader.SourceHF:
+		endpoint, token = hfEndpoint, hfToken
+	default:
+		fatal(fmt.Errorf("invalid -source %q (want auto, modelscope, or hf)", *source))
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workers := min(8, max(2, runtime.NumCPU()))
 	d := downloader.Downloader{
-		Endpoint:        strings.TrimRight(envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), "/"),
-		Token:           os.Getenv("MODELSCOPE_API_TOKEN"),
+		Source:          *source,
+		Endpoint:        strings.TrimRight(endpoint, "/"),
+		Token:           token,
+		HFEndpoint:      strings.TrimRight(hfEndpoint, "/"),
+		HFToken:         hfToken,
 		UserAgent:       "msget/" + version,
 		Workers:         workers,
 		Parts:           min(4, workers),

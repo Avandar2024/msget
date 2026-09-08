@@ -1,6 +1,6 @@
 # msget
 
-A ModelScope model downloader using only the Go standard library. It builds as a single executable and does not require Python, Git, or the ModelScope SDK.
+A ModelScope and Hugging Face mirror model downloader using only the Go standard library. It builds as a single executable and does not require Python, Git, or the ModelScope SDK.
 
 ## Build
 
@@ -47,6 +47,9 @@ default to make noise visible.
 # Download the full model into ./Qwen3-0.6B
 ./msget Qwen/Qwen3-0.6B
 
+# Download from the Hugging Face Chinese mirror (hf-mirror.com)
+./msget -source hf Qwen/Qwen3-0.6B
+
 # Choose an output directory and revision
 ./msget -o ./model -revision v1.0 Qwen/Qwen3-0.6B
 
@@ -57,7 +60,27 @@ default to make noise visible.
 ./msget -exclude '*.safetensors' Qwen/Qwen3-0.6B
 ```
 
-For private models, provide the token through an environment variable so it does not remain in shell history:
+The default `-source auto` first looks up the model on ModelScope and falls
+back to HF-Mirror when ModelScope returns HTTP 404. Authentication, network,
+and server errors do not trigger fallback. Use `-source modelscope` or
+`-source hf` to force one source. The default revision is `master` for
+ModelScope and `main` for Hugging Face; `-revision` overrides it for both.
+
+The Hugging Face source uses [HF-Mirror](https://hf-mirror.com) by default.
+Set `HF_ENDPOINT` to use another compatible endpoint, and `HF_TOKEN` for
+private or gated models (access must already be granted on Hugging Face):
+
+```bash
+HF_TOKEN=hf-xxx ./msget -source hf owner/private-model
+HF_ENDPOINT=https://huggingface.co ./msget -source hf Qwen/Qwen3-0.6B
+```
+
+HF downloads support the same filters, parallel ranges, and resume behavior.
+LFS files are verified against the API-provided SHA-256; ordinary Git files
+use size verification. Partial HF downloads are isolated from ModelScope
+checkpoints. Each source uses only its own token environment variable.
+
+For private ModelScope models, provide the token through an environment variable so it does not remain in shell history:
 
 ```bash
 MODELSCOPE_API_TOKEN=ms-xxx ./msget owner/private-model
