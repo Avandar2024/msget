@@ -218,29 +218,8 @@ func TestParallelRanges(t *testing.T) {
 func TestParallelLayoutUsesDynamicRanges(t *testing.T) {
 	t.Parallel()
 	connections, ranges := parallelLayout(1<<30, 4, 64<<20)
-	if connections != 4 || ranges != 64 {
-		t.Fatalf("layout = %d connections, %d ranges; want 4, 64", connections, ranges)
-	}
-}
-
-func TestParallelLayoutBoundsAdaptiveRangeSize(t *testing.T) {
-	t.Parallel()
-	tests := []struct {
-		name                string
-		size, rangeSize     int64
-		connections, ranges int
-	}{
-		{name: "small", size: 100 << 20, rangeSize: 64 << 20, connections: 4, ranges: 13},
-		{name: "huge", size: 100 << 30, rangeSize: 64 << 20, connections: 4, ranges: 1600},
-		{name: "explicit small ranges", size: 64 << 20, rangeSize: 4 << 20, connections: 4, ranges: 16},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			connections, ranges := parallelLayout(tt.size, 4, tt.rangeSize)
-			if connections != tt.connections || ranges != tt.ranges {
-				t.Fatalf("layout = %d connections, %d ranges; want %d, %d", connections, ranges, tt.connections, tt.ranges)
-			}
-		})
+	if connections != 4 || ranges != 16 {
+		t.Fatalf("layout = %d connections, %d ranges; want 4, 16", connections, ranges)
 	}
 }
 

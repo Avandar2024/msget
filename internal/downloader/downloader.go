@@ -359,11 +359,9 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
 const (
-	dynamicRangeSize    int64 = 64 << 20
-	minDynamicRangeSize int64 = 8 << 20
-	rangesPerConnection       = 16
-	checkpointBytes     int64 = 256 << 20
-	checkpointInterval        = 2 * time.Second
+	dynamicRangeSize   int64 = 64 << 20
+	checkpointBytes    int64 = 256 << 20
+	checkpointInterval       = 2 * time.Second
 )
 
 func checkpointDue(dirty int64, elapsed time.Duration) bool {
@@ -378,13 +376,6 @@ func parallelLayout(size int64, maxConnections int, rangeSize int64) (connection
 	if rangeSize <= 0 {
 		rangeSize = dynamicRangeSize
 	}
-	// Keep enough work queued for fast workers to run ahead of slow workers.
-	// The configured range size remains an upper bound, while huge files still
-	// use that bound so the request count cannot grow without limit.
-	floor := min(minDynamicRangeSize, rangeSize)
-	targetRanges := int64(connections * rangesPerConnection)
-	balanced := (size + targetRanges - 1) / targetRanges
-	rangeSize = max(floor, min(rangeSize, balanced))
 	ranges = max(connections, int((size+rangeSize-1)/rangeSize))
 	return connections, ranges
 }

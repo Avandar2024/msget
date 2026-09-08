@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"testing"
@@ -222,6 +223,30 @@ func TestDualTransportOnlyStaggersInitialConnections(t *testing.T) {
 		if got := connectionDelay(uint64(connection)); got != expected {
 			t.Errorf("connectionDelay(%d) = %v, want %v", connection, got, expected)
 		}
+	}
+}
+
+func TestRouteTrackerPrefersMeasuredFastAddress(t *testing.T) {
+	t.Parallel()
+	tracker := newRouteTracker()
+	addresses := []net.IP{net.ParseIP("192.0.2.1"), net.ParseIP("192.0.2.2")}
+	// Initial choices probe every address.
+	tracker.choose(addresses)
+	tracker.choose(addresses)
+	tracker.recordRate("192.0.2.1", 1)
+	tracker.recordRate("192.0.2.2", 100)
+	tracker.mu.Lock()
+	tracker.next = 3 // avoid the periodic recovery probe
+	tracker.mu.Unlock()
+	if got := tracker.choose(addresses).String(); got != "192.0.2.2" {
+		t.Fatalf("selected route %s, want fast route 192.0.2.2", got)
+	}
+	for range 10 {
+		tracker.recordFailure("192.0.2.2")
+	}
+	tracker.recordRate("192.0.2.1", 50)
+	if got := tracker.choose(addresses).String(); got != "192.0.2.1" {
+		t.Fatalf("selected route %s after failures, want 192.0.2.1", got)
 	}
 }
 

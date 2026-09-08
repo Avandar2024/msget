@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -40,12 +41,13 @@ func (d *Downloader) client() *http.Client {
 	if connectTimeout <= 0 || connectTimeout > 30*time.Second {
 		connectTimeout = 30 * time.Second
 	}
+	routes := newRouteTracker()
 	newTransport := func(network string, forceHTTP2 bool) *http.Transport {
 		dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 		return &http.Transport{
 			Proxy: http.ProxyFromEnvironment,
 			DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
-				return dialer.DialContext(ctx, network, address)
+				return routes.dial(ctx, dialer, network, address)
 			},
 			ForceAttemptHTTP2:     forceHTTP2,
 			MaxIdleConns:          max(16, workers*2),
@@ -65,7 +67,7 @@ func (d *Downloader) client() *http.Client {
 		transport = newTransport("tcp6", true)
 	case NetworkDual, "":
 		// Dual is the library default as well as the CLI default.
-		transport = &dualTransport{transports: [2]http.RoundTripper{newTransport("tcp4", false), newTransport("tcp6", false)}}
+		transport = &dualTransport{transports: [2]http.RoundTripper{newTransport("tcp4", false), newTransport("tcp6", false)}, routes: routes}
 	default:
 		transport = newTransport("tcp", true)
 	}
@@ -84,13 +86,14 @@ type dualTransport struct {
 	samples     [2]uint64
 	failures    [2]uint64
 	connections uint64
+	routes      *routeTracker
 }
 
 func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	first := t.choose()
-	resp, cancel, err := t.roundTrip(first, req)
+	resp, cancel, route, err := t.roundTrip(first, req)
 	if err == nil {
-		resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: first, owner: t, cancel: cancel}
+		resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: first, route: route, owner: t, cancel: cancel}
 		return resp, nil
 	}
 	t.recordFailure(first)
@@ -101,16 +104,16 @@ func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.Body != nil {
 		retry.Body, _ = req.GetBody()
 	}
-	resp, cancel, retryErr := t.roundTrip(1-first, retry)
+	resp, cancel, route, retryErr := t.roundTrip(1-first, retry)
 	if retryErr != nil {
 		t.recordFailure(1 - first)
 		return nil, errors.Join(err, retryErr)
 	}
-	resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: 1 - first, owner: t, cancel: cancel}
+	resp.Body = &measuredBody{ReadCloser: resp.Body, started: time.Now(), family: 1 - first, route: route, owner: t, cancel: cancel}
 	return resp, nil
 }
 
-func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response, context.CancelFunc, error) {
+func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response, context.CancelFunc, string, error) {
 	ctx, cancel := context.WithCancel(req.Context())
 	t.mu.Lock()
 	// Only stagger the initial probe wave. Delaying every later range would
@@ -129,9 +132,16 @@ func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response
 			}
 		}
 		cancel()
-		return nil, cancel, ctx.Err()
+		return nil, cancel, "", ctx.Err()
 	}
-	attempt := req.Clone(ctx)
+	var route string
+	trace := &httptrace.ClientTrace{GotConn: func(info httptrace.GotConnInfo) {
+		host, _, err := net.SplitHostPort(info.Conn.RemoteAddr().String())
+		if err == nil {
+			route = host
+		}
+	}}
+	attempt := req.Clone(httptrace.WithClientTrace(ctx, trace))
 	// Establish each range request at a different time; dual-mode transports
 	// disable HTTP/2 so closing a slow body also retires its TCP connection.
 	attempt.Close = true
@@ -139,7 +149,7 @@ func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response
 	if err != nil {
 		cancel()
 	}
-	return resp, cancel, err
+	return resp, cancel, route, err
 }
 
 func connectionDelay(connection uint64) time.Duration {
@@ -147,6 +157,97 @@ func connectionDelay(connection uint64) time.Duration {
 		return time.Duration(connection) * connectionStagger
 	}
 	return 0
+}
+
+type routeTracker struct {
+	mu       sync.Mutex
+	next     uint64
+	rate     map[string]float64
+	failures map[string]uint64
+}
+
+func newRouteTracker() *routeTracker {
+	return &routeTracker{rate: make(map[string]float64), failures: make(map[string]uint64)}
+}
+
+func (t *routeTracker) dial(ctx context.Context, dialer *net.Dialer, network, address string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || net.ParseIP(host) != nil {
+		return dialer.DialContext(ctx, network, address)
+	}
+	lookupNetwork := "ip"
+	if network == "tcp4" {
+		lookupNetwork = "ip4"
+	} else if network == "tcp6" {
+		lookupNetwork = "ip6"
+	}
+	addresses, err := net.DefaultResolver.LookupIP(ctx, lookupNetwork, host)
+	if err != nil || len(addresses) == 0 {
+		return dialer.DialContext(ctx, network, address)
+	}
+	eligible := addresses[:0]
+	for _, ip := range addresses {
+		if network == "tcp4" && ip.To4() == nil || network == "tcp6" && ip.To4() != nil {
+			continue
+		}
+		eligible = append(eligible, ip)
+	}
+	if len(eligible) == 0 {
+		return dialer.DialContext(ctx, network, address)
+	}
+	ip := t.choose(eligible)
+	return dialer.DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+}
+
+func (t *routeTracker) choose(addresses []net.IP) net.IP {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	ticket := t.next
+	t.next++
+	// Probe addresses without a completed sample first.
+	for offset := range addresses {
+		ip := addresses[(int(ticket)+offset)%len(addresses)]
+		if _, measured := t.rate[ip.String()]; !measured && t.failures[ip.String()] == 0 {
+			return ip
+		}
+	}
+	// Keep an occasional probe so recovered CDN edges can re-enter rotation.
+	if ticket%32 == 0 {
+		return addresses[int(ticket/32)%len(addresses)]
+	}
+	best := addresses[0]
+	bestScore := -1.0
+	for _, ip := range addresses {
+		key := ip.String()
+		score := t.rate[key] / float64(1+t.failures[key])
+		if score > bestScore {
+			best, bestScore = ip, score
+		}
+	}
+	return best
+}
+
+func (t *routeTracker) recordRate(route string, rate float64) {
+	if t == nil || route == "" || rate <= 0 {
+		return
+	}
+	t.mu.Lock()
+	if previous := t.rate[route]; previous > 0 {
+		t.rate[route] = previous*0.7 + rate*0.3
+	} else {
+		t.rate[route] = rate
+	}
+	t.failures[route] = 0
+	t.mu.Unlock()
+}
+
+func (t *routeTracker) recordFailure(route string) {
+	if t == nil || route == "" {
+		return
+	}
+	t.mu.Lock()
+	t.failures[route]++
+	t.mu.Unlock()
 }
 
 func (t *dualTransport) choose() int {
@@ -236,6 +337,7 @@ type measuredBody struct {
 	io.ReadCloser
 	started time.Time
 	family  int
+	route   string
 	owner   *dualTransport
 	bytes   int64
 	once    sync.Once
@@ -249,6 +351,7 @@ func (b *measuredBody) Read(p []byte) (int, error) {
 	if !b.aborted && b.owner.tooSlow(b.bytes, time.Since(b.started)) {
 		b.aborted = true
 		b.owner.recordFailure(b.family)
+		b.owner.routes.recordFailure(b.route)
 		b.cancel()
 		_ = b.ReadCloser.Close()
 		return n, errSlowConnection
@@ -265,6 +368,7 @@ func (b *measuredBody) Close() error {
 	b.once.Do(func() {
 		if !b.aborted {
 			b.owner.recordRate(b.family, b.bytes, time.Since(b.started))
+			b.owner.routes.recordRate(b.route, float64(b.bytes)/time.Since(b.started).Seconds())
 		}
 	})
 	return err

@@ -50,6 +50,7 @@ func main() {
 	source := flag.String("source", downloader.SourceAuto, "model source: auto, modelscope, or hf (Hugging Face mirror)")
 	revision := flag.String("revision", "", "branch, tag, or commit (default: master for ModelScope, main for hf)")
 	network := flag.String("network", downloader.NetworkDual, "connection family: auto, ipv4, ipv6, or dual")
+	connections := flag.Int("connections", 0, "maximum concurrent downloads (default: 2-8 based on CPUs)")
 
 	showVersion := flag.Bool("version", false, "show version")
 	flag.Var(&includes, "include", "download only files matching this glob (repeatable)")
@@ -75,6 +76,9 @@ func main() {
 		parts := strings.Split(strings.Trim(repo, "/"), "/")
 		*output = parts[len(parts)-1]
 	}
+	if *connections < 0 || *connections > 64 {
+		fatal(fmt.Errorf("invalid -connections %d (want 1-64, or 0 for automatic)", *connections))
+	}
 
 	endpoint, token := envOr("MODELSCOPE_ENDPOINT", "https://modelscope.cn"), os.Getenv("MODELSCOPE_API_TOKEN")
 	hfEndpoint, hfToken := envOr("HF_ENDPOINT", "https://hf-mirror.com"), os.Getenv("HF_TOKEN")
@@ -89,6 +93,11 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	workers := min(8, max(2, runtime.NumCPU()))
+	parts := workers
+	if *connections > 0 {
+		workers = *connections
+		parts = workers
+	}
 	d := downloader.Downloader{
 		Source:          *source,
 		Endpoint:        strings.TrimRight(endpoint, "/"),
@@ -97,7 +106,7 @@ func main() {
 		HFToken:         hfToken,
 		UserAgent:       "msget/" + version,
 		Workers:         workers,
-		Parts:           min(4, workers),
+		Parts:           parts,
 		RangeSize:       64 << 20,
 		Retries:         5,
 		Timeout:         60 * time.Second,
