@@ -3,11 +3,14 @@ CMD := ./cmd/msget
 BIN_DIR := bin
 VERSION ?= dev
 CGO_ENABLED ?= 0
+UPX_BIN ?= upx
+UPX_FLAGS ?= --best --lzma
+BUILD_TAGS ?= nethttpomithttp2
 GCFLAGS := all=-l
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
-BUILD_FLAGS := -trimpath -buildvcs=false -gcflags "$(GCFLAGS)" -ldflags "$(LDFLAGS)"
+BUILD_FLAGS := -tags "$(BUILD_TAGS)" -trimpath -buildvcs=false -gcflags "$(GCFLAGS)" -ldflags "$(LDFLAGS)"
 
-.PHONY: all build build-linux-amd64 test check coverage benchmark clean
+.PHONY: all build build-compressed build-linux-amd64 test check coverage benchmark clean
 
 BENCH_TIME ?= 1x
 BENCH_COUNT ?= 5
@@ -17,6 +20,11 @@ all: check build
 build:
 	mkdir -p $(BIN_DIR)
 	CGO_ENABLED=$(CGO_ENABLED) go build $(BUILD_FLAGS) -o $(BIN_DIR)/$(APP) $(CMD)
+
+build-compressed: build
+	cp $(BIN_DIR)/$(APP) $(BIN_DIR)/$(APP)-compressed
+	$(UPX_BIN) $(UPX_FLAGS) $(BIN_DIR)/$(APP)-compressed
+	$(UPX_BIN) -t $(BIN_DIR)/$(APP)-compressed
 
 build-linux-amd64:
 	mkdir -p $(BIN_DIR)

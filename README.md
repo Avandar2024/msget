@@ -13,10 +13,27 @@ make build
 The executable is written to `bin/msget`. Set `VERSION` to embed a release
 version, for example `make build VERSION=v1.2.0`.
 
+For a substantially smaller self-extracting executable, install UPX and run:
+
+```bash
+make build-compressed VERSION=v1.2.0
+```
+
+This keeps the regular binary at `bin/msget` and writes the packed binary to
+`bin/msget-compressed`. UPX adds a small startup decompression cost and packed
+executables may receive additional scrutiny from antivirus scanners, so the
+regular build remains the default.
+
 Release builds are stripped, omit build-path and VCS metadata, and disable
-CGO and function inlining to keep the executable small and portable. Override
-`CGO_ENABLED` when native C integration is required, for example
-`make build CGO_ENABLED=1`.
+CGO, function inlining, and the unused bundled HTTP/2 client to keep the
+executable small and portable. Downloads continue to use HTTP/1.1; direct
+`go build` retains Go's normal HTTP/2 support. Override `BUILD_TAGS` to restore
+it in a Makefile build, or `CGO_ENABLED` when native C integration is required:
+
+```bash
+make build BUILD_TAGS=
+make build CGO_ENABLED=1
+```
 
 Cross-compilation is also supported:
 
