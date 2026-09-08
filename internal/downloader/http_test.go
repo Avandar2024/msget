@@ -195,6 +195,36 @@ func TestMeasuredBodyRejectsSlowConnection(t *testing.T) {
 	}
 }
 
+func TestMeasuredBodyIgnoresStaleRate(t *testing.T) {
+	t.Parallel()
+	transport := &dualTransport{}
+	transport.recordRate(0, 40<<20, time.Second)
+	transport.mu.Lock()
+	transport.rateUpdated[0] = time.Now().Add(-slowRateMaxAge - time.Second)
+	transport.mu.Unlock()
+	body := &measuredBody{
+		ReadCloser: io.NopCloser(bytes.NewReader(make([]byte, 512<<10))),
+		started:    time.Now().Add(-4 * time.Second),
+		family:     1,
+		owner:      transport,
+		cancel:     func() {},
+	}
+	buffer := make([]byte, 512<<10)
+	if _, err := body.Read(buffer); err != nil {
+		t.Fatalf("Read() error = %v", err)
+	}
+}
+
+func TestDualTransportOnlyStaggersInitialConnections(t *testing.T) {
+	t.Parallel()
+	want := []time.Duration{0, connectionStagger, 2 * connectionStagger, 3 * connectionStagger, 0, 0}
+	for connection, expected := range want {
+		if got := connectionDelay(uint64(connection)); got != expected {
+			t.Errorf("connectionDelay(%d) = %v, want %v", connection, got, expected)
+		}
+	}
+}
+
 func TestDualTransportRequestsConnectionClose(t *testing.T) {
 	t.Parallel()
 	var closeRequested bool

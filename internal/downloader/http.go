@@ -21,6 +21,7 @@ const (
 
 	slowConnectionWindow = 3 * time.Second
 	slowConnectionRatio  = 0.3
+	slowRateMaxAge       = 30 * time.Second
 	connectionStagger    = 150 * time.Millisecond
 )
 
@@ -79,6 +80,7 @@ type dualTransport struct {
 	mu          sync.Mutex
 	next        uint64
 	rate        [2]float64
+	rateUpdated [2]time.Time
 	samples     [2]uint64
 	failures    [2]uint64
 	connections uint64
@@ -111,7 +113,9 @@ func (t *dualTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response, context.CancelFunc, error) {
 	ctx, cancel := context.WithCancel(req.Context())
 	t.mu.Lock()
-	delay := time.Duration(t.connections%4) * connectionStagger
+	// Only stagger the initial probe wave. Delaying every later range would
+	// leave a fast worker idle between chunks and cap aggregate throughput.
+	delay := connectionDelay(t.connections)
 	t.connections++
 	t.mu.Unlock()
 	timer := time.NewTimer(delay)
@@ -136,6 +140,13 @@ func (t *dualTransport) roundTrip(family int, req *http.Request) (*http.Response
 		cancel()
 	}
 	return resp, cancel, err
+}
+
+func connectionDelay(connection uint64) time.Duration {
+	if connection < 4 {
+		return time.Duration(connection) * connectionStagger
+	}
+	return 0
 }
 
 func (t *dualTransport) choose() int {
@@ -199,6 +210,7 @@ func (t *dualTransport) recordRate(family int, bytes int64, elapsed time.Duratio
 		t.rate[family] = t.rate[family]*0.7 + rate*0.3
 	}
 	t.samples[family]++
+	t.rateUpdated[family] = time.Now()
 	t.failures[family] = 0
 	t.mu.Unlock()
 }
@@ -208,8 +220,14 @@ func (t *dualTransport) tooSlow(bytes int64, elapsed time.Duration) bool {
 		return false
 	}
 	current := float64(bytes) / elapsed.Seconds()
+	now := time.Now()
 	t.mu.Lock()
-	reference := max(t.rate[0], t.rate[1])
+	var reference float64
+	for family, rate := range t.rate {
+		if now.Sub(t.rateUpdated[family]) <= slowRateMaxAge {
+			reference = max(reference, rate)
+		}
+	}
 	t.mu.Unlock()
 	return reference > 0 && current < reference*slowConnectionRatio
 }

@@ -234,6 +234,12 @@ func (d *Downloader) downloadFile(ctx context.Context, repo, revision, root stri
 		}
 		if downloadErr != nil {
 			last = downloadErr
+			// A slow connection is deliberately retired by dualTransport. Replace
+			// it immediately: sleeping and consuming the ordinary failure budget
+			// defeats the purpose of searching for a faster route.
+			if errors.Is(downloadErr, errSlowConnection) {
+				attempt--
+			}
 			continue
 		}
 		if err := verifyFile(part, f, d.Verify); err != nil {
@@ -466,6 +472,10 @@ func (d *Downloader) downloadParallel(ctx context.Context, repo, revision, part 
 					mu.Unlock()
 					if downloadErr == nil {
 						break
+					}
+					if errors.Is(downloadErr, errSlowConnection) {
+						attempt--
+						continue
 					}
 					if errors.Is(downloadErr, errRangeUnsupported) || attempt >= d.Retries {
 						mu.Lock()
