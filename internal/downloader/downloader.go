@@ -344,7 +344,7 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 		return err
 	}
 	reader := &activityReader{r: resp.Body, timer: timer, timeout: d.Timeout, onRead: fileProgress.read}
-	_, copyErr := io.CopyBuffer(out, reader, make([]byte, 1<<20))
+	_, copyErr := copyWithDownloadBuffer(out, reader)
 	syncErr := out.Sync()
 	closeErr := out.Close()
 	if copyErr != nil {
@@ -359,9 +359,11 @@ func (d *Downloader) downloadAttemptWithSlots(ctx context.Context, repo, revisio
 var errRangeUnsupported = errors.New("server does not support ranged downloads")
 
 const (
-	dynamicRangeSize   int64 = 64 << 20
-	checkpointBytes    int64 = 256 << 20
-	checkpointInterval       = 2 * time.Second
+	dynamicRangeSize    int64 = 64 << 20
+	minDynamicRangeSize int64 = 8 << 20
+	rangesPerConnection       = 16
+	checkpointBytes     int64 = 256 << 20
+	checkpointInterval        = 2 * time.Second
 )
 
 func checkpointDue(dirty int64, elapsed time.Duration) bool {
@@ -376,6 +378,13 @@ func parallelLayout(size int64, maxConnections int, rangeSize int64) (connection
 	if rangeSize <= 0 {
 		rangeSize = dynamicRangeSize
 	}
+	// Keep enough work queued for fast workers to run ahead of slow workers.
+	// The configured range size remains an upper bound, while huge files still
+	// use that bound so the request count cannot grow without limit.
+	floor := min(minDynamicRangeSize, rangeSize)
+	targetRanges := int64(connections * rangesPerConnection)
+	balanced := (size + targetRanges - 1) / targetRanges
+	rangeSize = max(floor, min(rangeSize, balanced))
 	ranges = max(connections, int((size+rangeSize-1)/rangeSize))
 	return connections, ranges
 }
@@ -556,7 +565,7 @@ func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, o
 	if resp.StatusCode != http.StatusPartialContent || !strings.HasPrefix(resp.Header.Get("Content-Range"), wantPrefix) {
 		return 0, errRangeUnsupported
 	}
-	written, err := io.CopyBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout, onRead: fileProgress.read}, make([]byte, 1<<20))
+	written, err := copyWithDownloadBuffer(io.NewOffsetWriter(out, start), &activityReader{r: io.LimitReader(resp.Body, end-start+1), timer: timer, timeout: d.Timeout, onRead: fileProgress.read})
 	if err != nil {
 		return written, err
 	}
@@ -564,6 +573,17 @@ func (d *Downloader) downloadRange(ctx context.Context, repo, revision string, o
 		return written, fmt.Errorf("incomplete range: got %d bytes, expected %d", written, end-start+1)
 	}
 	return written, nil
+}
+
+var downloadBufferPool = sync.Pool{New: func() any {
+	buffer := make([]byte, 1<<20)
+	return &buffer
+}}
+
+func copyWithDownloadBuffer(dst io.Writer, src io.Reader) (int64, error) {
+	buffer := downloadBufferPool.Get().(*[]byte)
+	defer downloadBufferPool.Put(buffer)
+	return io.CopyBuffer(dst, src, *buffer)
 }
 
 func acquire(ctx context.Context, slots chan struct{}) error {
